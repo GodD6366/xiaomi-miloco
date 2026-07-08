@@ -301,6 +301,7 @@ def select_active_camera_dids(
     require_lan: bool = True,
     cap: bool = True,
     apply_schedule: bool = True,
+    now: datetime | None = None,
 ) -> list[str]:
     """决定哪些相机处于 scope 内且可连接/拉流的**单一口径**。
 
@@ -323,7 +324,8 @@ def select_active_camera_dids(
 
     denied = denied_camera_dids(kv_repo)
     schedules = load_schedule_map(kv_repo) if apply_schedule else None
-    now = datetime.now(deploy_timezone()) if apply_schedule else None
+    if apply_schedule:
+        now = now or datetime.now(deploy_timezone())
     result: list[str] = []
     for did, info in cameras.items():
         if did in denied:

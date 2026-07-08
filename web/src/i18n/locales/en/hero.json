@@ -40,6 +40,8 @@
     "scheduleNeedWeekday": "Select at least one day",
     "scheduleNeedWindow": "Keep at least one window",
     "scheduleInvalid": "Fill in complete times",
+    "scheduleOverlap": "Windows must not overlap or be zero-length",
+    "scheduleCappedOut": "At capacity, not feeding",
     "toggleAriaInUse": "Disable {{name}}",
     "toggleAriaNotInUse": "Enable {{name}}",
     "toggleTitleInUse": "miloco is using this one · Tap to disable",

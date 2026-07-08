@@ -924,6 +924,7 @@ interface BackendScopeCamera {
   is_online: boolean;
   in_use: boolean;
   effective_in_use?: boolean;
+  capped_out?: boolean;
   schedule_paused?: boolean;
   schedule?: CameraSchedule;
   next_schedule_change_at?: string | null;
@@ -951,6 +952,7 @@ export async function realListScopeCameras(): Promise<ScopeCamera[]> {
     isOnline: c.is_online,
     inUse: c.in_use,
     effectiveInUse: c.effective_in_use ?? c.in_use,
+    cappedOut: c.capped_out ?? false,
     schedulePaused: c.schedule_paused ?? false,
     schedule: normalizeCameraSchedule(c.schedule),
     nextScheduleChangeAt: c.next_schedule_change_at ?? undefined,

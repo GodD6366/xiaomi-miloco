@@ -40,6 +40,7 @@ from miloco.miot.filter import (
     filter_by_home,
     is_home_allowed,
     next_camera_schedule_change_at,
+    select_active_camera_dids,
     set_camera_schedule,
     set_cameras_in_use,
     set_homes_in_use,
@@ -989,9 +990,31 @@ class MiotService:
         # 设备删除后不会自动清除，需要用 _device_info_dict 做交集校验。
         devices = await self._miot_proxy.get_devices()
         cameras = {did: info for did, info in cameras.items() if did in devices}
-        out: list[dict] = []
         tz = deploy_timezone()
         now = datetime.now(tz)
+        feeding_dids = set(
+            select_active_camera_dids(
+                self._kv_repo,
+                cameras,
+                online_only=True,
+                require_lan=True,
+                cap=True,
+                apply_schedule=True,
+                now=now,
+            )
+        )
+        cap_eligible_dids = set(
+            select_active_camera_dids(
+                self._kv_repo,
+                cameras,
+                online_only=True,
+                require_lan=True,
+                cap=False,
+                apply_schedule=True,
+                now=now,
+            )
+        )
+        out: list[dict] = []
         schedule_map = load_schedule_map(self._kv_repo)
         for did, info in cameras.items():
             online = bool(getattr(info, "online", False)) and bool(
@@ -1000,6 +1023,12 @@ class MiotService:
             schedule = camera_schedule_for(self._kv_repo, did, schedules=schedule_map)
             in_use = did not in denied
             schedule_paused = in_use and camera_schedule_paused(schedule, now)
+            schedule_eligible = in_use and not schedule_paused
+            capped_out = (
+                schedule_eligible
+                and did in cap_eligible_dids
+                and did not in feeding_dids
+            )
             next_change = (
                 next_camera_schedule_change_at(schedule, now, tz) if in_use else None
             )
@@ -1012,7 +1041,8 @@ class MiotService:
                     "room_name": getattr(info, "room_name", None),
                     "is_online": online,
                     "in_use": in_use,
-                    "effective_in_use": in_use and not schedule_paused,
+                    "effective_in_use": did in feeding_dids,
+                    "capped_out": capped_out,
                     "schedule_paused": schedule_paused,
                     "schedule": schedule,
                     "next_schedule_change_at": (

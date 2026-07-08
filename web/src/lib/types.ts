@@ -193,6 +193,7 @@ export interface ScopeCamera {
   isOnline: boolean;
   inUse: boolean;
   effectiveInUse: boolean;
+  cappedOut: boolean;
   schedulePaused: boolean;
   schedule: CameraSchedule;
   nextScheduleChangeAt?: string;

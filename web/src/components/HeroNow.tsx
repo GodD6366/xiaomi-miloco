@@ -23,6 +23,36 @@ import { IconClock, IconPlus, IconTrash, IconX } from "@/lib/icons";
 
 const CAMERA_SCHEDULE_WEEKDAYS = [0, 1, 2, 3, 4, 5, 6];
 
+function scheduleMinuteOfDay(value: string): number {
+  const [hour, minute] = value.split(":").map((part) => Number(part));
+  return hour * 60 + minute;
+}
+
+function scheduleDayIntervals(start: number, end: number): [number, number][] {
+  if (start === end) return [];
+  if (start < end) return [[start, end]];
+  return [[start, 24 * 60], [0, end]];
+}
+
+function scheduleWindowsInvalid(
+  windows: Array<{ start: string; end: string }>,
+): boolean {
+  const occupied: [number, number][] = [];
+  for (const window of windows) {
+    const start = scheduleMinuteOfDay(window.start);
+    const end = scheduleMinuteOfDay(window.end);
+    if (start === end) return true;
+    for (const interval of scheduleDayIntervals(start, end)) {
+      occupied.push(interval);
+    }
+  }
+  occupied.sort((a, b) => a[0] - b[0]);
+  for (let i = 1; i < occupied.length; i++) {
+    if (occupied[i][0] < occupied[i - 1][1]) return true;
+  }
+  return false;
+}
+
 interface Props {
   persons: Person[];
   /** perception 当前订阅的画面（含 channel，用于真播放）；scope 是子集映射的字典源 */
@@ -202,7 +232,7 @@ function CameraSection({
   const activeCount = scopeCameras.filter((c) => c.effectiveInUse).length;
   const allOn = total > 0 && manualOnCount === total;
   const allOff = manualOnCount === 0;
-  // 满额判断按后端 effective_in_use 计数:被定时暂停的相机不占实时投喂名额。
+  // 满额判断按后端 effective_in_use 计数:只统计当前实际在投喂的相机。
   const atCapacity = activeCount >= maxStreamCams;
   // 「全开」只能开「在线且未投喂」的——离线相机后端 toggle_camera 会整批拒绝
   // (offline_enable 校验),若把离线 did 也塞进批量 enable,会连带在线的一起失败。
@@ -482,7 +512,7 @@ function BenchCamItem({
         >
           {cam.name}
         </div>
-        {(!cam.isOnline || cam.roomName || cam.schedulePaused) && (
+        {(!cam.isOnline || cam.roomName || cam.schedulePaused || cam.cappedOut) && (
           <div className="text-caption text-text-tertiary truncate">
             {!cam.isOnline && (
               <span className="text-warning">{t("hero.benchOffline")}</span>
@@ -495,6 +525,12 @@ function BenchCamItem({
                 <span className="text-brand-primary">
                   {t("hero.schedulePaused")}
                 </span>
+              </>
+            )}
+            {cam.cappedOut && (
+              <>
+                {(cam.roomName || !cam.isOnline || cam.schedulePaused) ? " · " : ""}
+                <span className="text-warning">{t("hero.scheduleCappedOut")}</span>
               </>
             )}
           </div>
@@ -585,14 +621,19 @@ function CameraScheduleDialog({
       setError(t("hero.scheduleInvalid"));
       return;
     }
+    const normalizedWindows = nextWindows.map((window) => ({
+      start: normalizeTimeValue(window.start),
+      end: normalizeTimeValue(window.end),
+    }));
+    if (enabled && scheduleWindowsInvalid(normalizedWindows)) {
+      setError(t("hero.scheduleOverlap"));
+      return;
+    }
     setError(null);
     await onSave({
-      enabled: enabled && nextWindows.length > 0,
+      enabled: enabled && normalizedWindows.length > 0,
       weekdays,
-      windows: nextWindows.map((window) => ({
-        start: normalizeTimeValue(window.start),
-        end: normalizeTimeValue(window.end),
-      })),
+      windows: normalizedWindows,
     });
   };
 

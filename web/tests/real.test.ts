@@ -166,6 +166,35 @@ describe("realListScopeCameras — schedule 字段映射", () => {
     });
   });
 
+  it("映射 capped_out 字段", async () => {
+    mockFetchByUrl({
+      "/api/miot/scope/cameras": {
+        code: 0,
+        message: "ok",
+        data: [
+          {
+            did: "cam2",
+            name: "卧室",
+            is_online: true,
+            in_use: true,
+            effective_in_use: false,
+            capped_out: true,
+            schedule_paused: false,
+            schedule: { enabled: false, weekdays: [0, 1, 2, 3, 4, 5, 6], windows: [] },
+            connected: false,
+          },
+        ],
+      },
+    });
+
+    const cameras = await realListScopeCameras();
+    expect(cameras[0]).toMatchObject({
+      did: "cam2",
+      effectiveInUse: false,
+      cappedOut: true,
+    });
+  });
+
   it("映射 schedule weekdays", async () => {
     mockFetchByUrl({
       "/api/miot/scope/cameras": {

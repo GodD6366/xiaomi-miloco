@@ -582,8 +582,45 @@ async def test_list_cameras_with_state_schedule_flags(monkeypatch):
     assert cam["in_use"] is True
     assert cam["schedule_paused"] is True
     assert cam["effective_in_use"] is False
+    assert cam["capped_out"] is False
     assert cam["schedule"]["enabled"] is True
     assert cam["next_schedule_change_at"] == "2026-06-22T08:00:00+08:00"
+
+
+@pytest.mark.asyncio
+async def test_list_cameras_with_state_marks_capped_out(monkeypatch):
+    monkeypatch.setattr("miloco.miot.filter.MAX_ENABLED_CAMERAS", 2)
+    kv = _FakeKV({ScopeConfigKeys.HOME_WHITE_LIST_KEY: json.dumps(["H1"])})
+    cameras = {
+        "c1": _camera("c1", home_id="H1"),
+        "c2": _camera("c2", home_id="H1"),
+        "c3": _camera("c3", home_id="H1"),
+    }
+    svc = _make_service(devices=dict(cameras), cameras=cameras, kv=kv)
+    out = await svc.list_cameras_with_state()
+    by_did = {c["did"]: c for c in out}
+
+    assert by_did["c1"]["effective_in_use"] is True
+    assert by_did["c2"]["effective_in_use"] is True
+    assert by_did["c3"]["effective_in_use"] is False
+    assert by_did["c3"]["capped_out"] is True
+    assert by_did["c3"]["in_use"] is True
+
+
+@pytest.mark.asyncio
+async def test_set_camera_schedule_rejects_out_of_scope_home():
+    kv = _FakeKV({ScopeConfigKeys.HOME_WHITE_LIST_KEY: json.dumps(["H1"])})
+    cameras = {
+        "c1": _camera("c1", home_id="H1"),
+        "c2": _camera("c2", home_id="H2"),
+    }
+    svc = _make_service(devices={"c2": cameras["c2"]}, cameras=cameras, kv=kv)
+
+    with pytest.raises(ValidationException, match="Unknown camera did"):
+        await svc.set_camera_schedule(
+            "c2",
+            CameraSchedule(enabled=True, windows=[CameraScheduleWindow(start="08:00", end="20:00")]),
+        )
 
 
 @pytest.mark.asyncio
