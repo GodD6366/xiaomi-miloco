@@ -232,8 +232,8 @@ function CameraSection({
   const activeCount = scopeCameras.filter((c) => c.effectiveInUse).length;
   const allOn = total > 0 && manualOnCount === total;
   const allOff = manualOnCount === 0;
-  // 满额判断按后端 effective_in_use 计数:只统计当前实际在投喂的相机。
-  const atCapacity = activeCount >= maxStreamCams;
+  // 满额判断按手动启用集计数,与后端 toggle_camera 上限口径一致。
+  const atCapacity = manualOnCount >= maxStreamCams;
   // 「全开」只能开「在线且未投喂」的——离线相机后端 toggle_camera 会整批拒绝
   // (offline_enable 校验),若把离线 did 也塞进批量 enable,会连带在线的一起失败。
   // 与下区单台开关「离线不可开」同口径。

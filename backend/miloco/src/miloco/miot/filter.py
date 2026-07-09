@@ -184,12 +184,6 @@ def set_camera_schedule(kv_repo: KVRepo, did: str, schedule: dict) -> tuple[dict
     return normalized, True
 
 
-def _minute_in_window(minute: int, start: int, end: int) -> bool:
-    if start < end:
-        return start <= minute < end
-    return minute >= start or minute < end
-
-
 def camera_schedule_paused(schedule: dict, now: datetime) -> bool:
     normalized = normalize_camera_schedule(schedule)
     if not normalized["enabled"]:
