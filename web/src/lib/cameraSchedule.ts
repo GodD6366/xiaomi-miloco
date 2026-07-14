@@ -53,6 +53,14 @@ export function mergeScheduleWindows(
     if (!last || start > last[1]) merged.push([start, end]);
     else last[1] = Math.max(last[1], end);
   }
+  // 半开区间无法用单个 HH:MM 窗口表达完整 24h（00:00-00:00 会被后端判零长）。
+  // 拆成两段相邻半日，后端可接受且仍覆盖全天，从而保留「全天但仅工作日」等配置。
+  if (merged.length === 1 && merged[0][0] === 0 && merged[0][1] === DAY) {
+    return [
+      { start: "00:00", end: "12:00" },
+      { start: "12:00", end: "00:00" },
+    ];
+  }
   if (
     merged.length >= 2 &&
     merged[0][0] === 0 &&
@@ -60,6 +68,13 @@ export function mergeScheduleWindows(
   ) {
     const morningEnd = merged[0][1];
     const eveningStart = merged[merged.length - 1][0];
+    // 首尾相接且中间无空隙 → 实质已铺满整天
+    if (morningEnd === eveningStart && merged.length === 2) {
+      return [
+        { start: "00:00", end: "12:00" },
+        { start: "12:00", end: "00:00" },
+      ];
+    }
     const middle = merged.slice(1, -1);
     const out = middle.map(([start, end]) => ({
       start: minuteToScheduleTime(start),

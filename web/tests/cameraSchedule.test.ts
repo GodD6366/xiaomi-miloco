@@ -48,6 +48,34 @@ describe("mergeScheduleWindows", () => {
       ]),
     ).toEqual([{ start: "09:00", end: "10:00" }]);
   });
+
+  it("encodes full-day coverage as two abutting halves (not 00:00-00:00)", () => {
+    expect(
+      mergeScheduleWindows([
+        { start: "08:00", end: "20:00" },
+        { start: "20:00", end: "08:00" },
+      ]),
+    ).toEqual([
+      { start: "00:00", end: "12:00" },
+      { start: "12:00", end: "00:00" },
+    ]);
+  });
+
+  it("encodes a single overnight wrap that fills the day the same way", () => {
+    expect(
+      mergeScheduleWindows([{ start: "00:00", end: "00:00" }]),
+    ).toEqual([]);
+    expect(
+      mergeScheduleWindows([
+        { start: "00:00", end: "06:00" },
+        { start: "06:00", end: "18:00" },
+        { start: "18:00", end: "00:00" },
+      ]),
+    ).toEqual([
+      { start: "00:00", end: "12:00" },
+      { start: "12:00", end: "00:00" },
+    ]);
+  });
 });
 
 describe("isCrossMidnightWindow", () => {
