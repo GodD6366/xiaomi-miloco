@@ -921,6 +921,10 @@ interface BackendScopeCamera {
   did: string;
   name: string | null;
   room_name?: string | null;
+  // 三个正交可用性指标。旧后端只有 is_online 时用它兜底 cloud+lan。
+  cloud_online?: boolean;
+  lan_reachable?: boolean;
+  awake?: boolean | null;
   is_online: boolean;
   in_use: boolean;
   effective_in_use?: boolean;
@@ -928,6 +932,9 @@ interface BackendScopeCamera {
   schedule_paused?: boolean;
   schedule?: CameraSchedule;
   next_schedule_change_at?: string | null;
+  // 拾音存储偏好（在拾音白名单即 true，**默认 false**，opt-in）。false = 该相机声音
+  // 完全不被处理。旧后端无此字段时兜底 false（默认关，与后端默认姿态一致）。
+  voice_in_use?: boolean;
   connected: boolean;
 }
 
@@ -949,8 +956,12 @@ export async function realListScopeCameras(): Promise<ScopeCamera[]> {
     did: c.did,
     name: c.name ?? c.did,
     roomName: c.room_name ?? undefined,
-    isOnline: c.is_online,
+    // 旧后端无三指标时用 is_online 兜底：cloud/lan 都取 is_online、awake 未知。
+    cloudOnline: c.cloud_online ?? c.is_online,
+    lanReachable: c.lan_reachable ?? c.is_online,
+    awake: c.awake ?? null,
     inUse: c.in_use,
+    voiceInUse: c.voice_in_use ?? false,
     effectiveInUse: c.effective_in_use ?? c.in_use,
     cappedOut: c.capped_out ?? false,
     schedulePaused: c.schedule_paused ?? false,
@@ -969,9 +980,11 @@ export async function realListScopeCameras(): Promise<ScopeCamera[]> {
 // 仍能拿到上一份缓存,不阻断列表渲染。
 let lastCamRefreshTs = 0;
 const CAM_REFRESH_THROTTLE_MS = 8000;
-export async function realRefreshCameraOnline(): Promise<void> {
+export async function realRefreshCameraOnline(force = false): Promise<void> {
   const now = Date.now();
-  if (now - lastCamRefreshTs < CAM_REFRESH_THROTTLE_MS) return;
+  // force = 手动刷新按钮:绕过 8s 节流(用户主动点应即时响应);自动加载(force=false)
+  // 仍走节流,防列表频繁 / 并发加载狂打后端 → 米家云限频。
+  if (!force && now - lastCamRefreshTs < CAM_REFRESH_THROTTLE_MS) return;
   lastCamRefreshTs = now;
   await apiFetch<Normal<unknown>>("/api/miot/refresh_camera_online");
 }
@@ -1000,6 +1013,23 @@ export async function realSetScopeCameraSchedule(
     },
   );
   invalidateMiotHomeCache();
+}
+
+// 拾音开关走独立端点 PUT /api/miot/scope/cameras/voice（不复用相机启用端点：
+// 拾音无投喂上限/离线校验、不重启感知引擎）。关闭 = mic-off：该相机声音完全不被处理
+// （引擎入口剥离音频）。后端只接受对 in_use=true 相机的设置,
+// 感知已关闭的相机会被拒（前端已把其开关置灰,这是二次兜底）。
+// 不 invalidate homeCache:拾音状态只存在于 /scope/cameras,调用方 reload scopeCameras 即可。
+export async function realToggleScopeCameraVoice(
+  dids: string[],
+  voiceInUse: boolean,
+): Promise<void> {
+  await apiFetch<Normal<unknown>>("/api/miot/scope/cameras/voice", {
+    method: "PUT",
+    body: JSON.stringify({
+      items: dids.map((did) => ({ did, voice_in_use: voiceInUse })),
+    }),
+  });
 }
 
 // ── 今天发生了什么(meaningful_events)───────────────────────

@@ -19,11 +19,13 @@ import {
   resumePerception,
   setScopeCameraSchedule,
   toggleScopeCamera,
+  toggleScopeCameraVoice,
   switchScopeHome,
 } from "./api";
 import { useAsync } from "./hooks/useAsync";
 import type { Person } from "./lib/types";
 import { Sidebar, MobileTabBar, type TabKey } from "./components/Sidebar";
+import { SettingsDrawer } from "./components/SettingsDrawer";
 import { HomeSwitcher } from "./components/HomeSwitcher";
 import { StatusRibbon } from "./components/StatusRibbon";
 import { HeroNow } from "./components/HeroNow";
@@ -169,6 +171,7 @@ function MainApp() {
   // Person；null 时回退到第一位。改名 / 删除后随 reload 自动同步。
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
   const [miotBindOpen, setMiotBindOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   // 米家家庭名直接走 backend `/api/miot/home::home_name`，米家给啥前端就显啥；
   // 未绑或 backend 没返时**不渲染** HomeSwitcher（未登录提示由头像 button 承担，
@@ -236,6 +239,19 @@ function MainApp() {
                 cameras.reload();
                 status.reload();
               }}
+              onToggleCameraVoice={async (did, voiceInUse) => {
+                try {
+                  await toggleScopeCameraVoice([did], voiceInUse);
+                } catch (e) {
+                  toast(
+                    e instanceof Error ? e.message : t("common.switchFailed"),
+                    "warn",
+                  );
+                }
+                // 拾音开关只改 KV 偏好,不动投喂/流(音频在引擎入口按 KV 实时剥离),
+                // 只需 reload scopeCameras 拿新 voiceInUse。
+                scopeCameras.reload();
+              }}
               onSetCameraSchedule={async (did, schedule) => {
                 try {
                   await setScopeCameraSchedule(did, schedule);
@@ -250,6 +266,13 @@ function MainApp() {
                   cameras.reload();
                   status.reload();
                 }
+              }}
+              onRefresh={async () => {
+                // 手动刷新:force 绕过 8s 节流打后端刷相机状态,再 await 列表重拉落地——
+                // reload() 的 Promise 在 listScopeCameras settle 后 resolve,故 onRefresh 完成
+                // = 列表已更新到位,刷新按钮转圈据此精确覆盖全程(不被其他 reload 借用)。
+                await refreshCameraOnline(homeId, true).catch(() => {});
+                await scopeCameras.reload();
               }}
             />
           </div>
@@ -379,6 +402,7 @@ function MainApp() {
         miot={status.data?.miot}
         onOpenMiotBind={() => setMiotBindOpen(true)}
         onMiotChanged={() => window.location.reload()}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
 
       {/* 主区:固定高度 + flex-col,TopBar/StatusRibbon 顶在上面,只 main 区滚 */}
@@ -497,6 +521,7 @@ function MainApp() {
             miot={status.data?.miot}
             onOpenMiotBind={() => setMiotBindOpen(true)}
             onMiotChanged={() => window.location.reload()}
+            onOpenSettings={() => setSettingsOpen(true)}
           />
         </div>
       </div>
@@ -535,6 +560,8 @@ function MainApp() {
           window.location.reload();
         }}
       />
+
+      <SettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} />
 
       <ToastHost />
     </div>

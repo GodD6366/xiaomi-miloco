@@ -1,6 +1,15 @@
-<h1 align="center">Xiaomi Miloco</h1>
+<div align="center">
 
-<p align="center">English | <a href="README.zh.md">简体中文</a></p>
+# Xiaomi Miloco
+
+English | [简体中文](README.zh.md)
+
+[![Latest release](https://img.shields.io/github/v/release/XiaoMi/xiaomi-miloco?label=release)](https://github.com/XiaoMi/xiaomi-miloco/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/XiaoMi/xiaomi-miloco/total)](https://github.com/XiaoMi/xiaomi-miloco/releases)
+[![Stars](https://img.shields.io/github/stars/XiaoMi/xiaomi-miloco)](https://github.com/XiaoMi/xiaomi-miloco/stargazers)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/XiaoMi/xiaomi-miloco/pulls)
+
+</div>
 
 Xiaomi's open-source AI solution for the future of whole-home intelligence. It uses the video and audio from Mi Home cameras as a full-modal perception gateway, the in-house MiMo large model as its intelligent brain, and runs as an Agent plugin on top of [OpenClaw](https://openclaw.ai) to orchestrate whole-home devices for a proactive, intelligent experience.
 
@@ -10,6 +19,7 @@ Miloco 2.0 perceives what happens at home, makes proactive decisions and control
 
 ## What's New
 
+- **2026-07-03** — Release v2026.7.3: adds event-feedback packaging and a conversational first-run setup, proactively initiated on fresh installs; plus improvements to in-dashboard model-config management, perception stability (false-"person" detection guarding), camera lifecycle, and CLI diagnostics.
 - **2026-06-18** — Miloco 2.0 officially released: re-architected as an OpenClaw plugin, adding general common sense, identity recognition, home memory, household tasks, proactive intelligence, and a home dashboard. See [Core Features](#core-features) below.
 
 ## Core Features
@@ -28,6 +38,7 @@ Miloco 2.0 perceives what happens at home, makes proactive decisions and control
 
 - **Hardware**: ≥ 4GB RAM and ≥ 256GB storage recommended, running 24/7. A Mac mini is recommended.
 - **Operating System**: macOS / Linux (run under WSL on Windows).
+- **OpenClaw** — Miloco runs as a plugin on top of it, so [install it](https://openclaw.ai) first with version ≥ 2026.5.2.
 - **Xiaomi account** + devices already added to Mi Home.
 - **Multimodal large model API key** — [Xiaomi MiMo](https://platform.xiaomimimo.com) is recommended: MiMo-v2.5 for perception, MiMo-v2.5-pro for the Agent (configured in OpenClaw).
 

@@ -7,6 +7,8 @@ from miloco_cli.output import print_result
 
 _HOMES_PATH = "/api/miot/scope/homes"
 _CAMERAS_PATH = "/api/miot/scope/cameras"
+_CAMERAS_VOICE_PATH = "/api/miot/scope/cameras/voice"
+
 _ALL_WEEKDAYS = [0, 1, 2, 3, 4, 5, 6]
 _WEEKDAY_ALIASES = {
     "1": 0,
@@ -85,6 +87,7 @@ def _normalize_window_time(value: str) -> str:
     return f"{hour:02d}:{minute:02d}"
 
 
+
 @click.group("scope")
 def scope_group():
     """管理 miloco 的感知范围：哪些家庭、哪些摄像头接入。"""
@@ -125,7 +128,8 @@ def scope_camera():
 @scope_camera.command("list")
 @click.option("--pretty", is_flag=True)
 def scope_camera_list(pretty):
-    """列出全部摄像头；in_use=已开启，is_online=设备在线，connected=视频流已连接。"""
+    """列出全部摄像头；in_use=当下真正开启(活跃集,≤4)，三态可用性 cloud_online(云端在线)/
+    lan_reachable(局域网可达)/awake(镜头开关:true=开/false=关/null=未知)，connected=视频流已连接。"""
     print_result(api_get(_CAMERAS_PATH), pretty)
 
 
@@ -146,6 +150,36 @@ def scope_camera_disable(dids, pretty):
     result = api_put(_CAMERAS_PATH, {"items": [{"did": d, "in_use": False} for d in dids]})
     print_result(result, pretty)
 
+
+# ── 拾音开关（mic-off 语义）：与 enable/disable 同款批量 did 语义，走 voice 端点 ──
+#
+# 关闭 = 该相机声音完全不被处理（引擎入口剥离音频：不转写、不上云、语音指令不
+# dispatch），视频照常感知。从属规则：仅感知已启用(in_use=true)的相机可设，感知已
+# 关闭时 backend 整批拒绝——api_put 透传其错误信息并以业务错误码退出，CLI 不吞。
+
+
+@scope_camera.command("mic-on")
+@click.argument("dids", nargs=-1, required=True)
+@click.option("--pretty", is_flag=True)
+def scope_camera_mic_on(dids, pretty):
+    """开启指定摄像头声音（声音重新参与感知）。"""
+    result = api_put(
+        _CAMERAS_VOICE_PATH,
+        {"items": [{"did": d, "voice_in_use": True} for d in dids]},
+    )
+    print_result(result, pretty)
+
+
+@scope_camera.command("mic-off")
+@click.argument("dids", nargs=-1, required=True)
+@click.option("--pretty", is_flag=True)
+def scope_camera_mic_off(dids, pretty):
+    """关闭指定摄像头声音（该相机声音完全不被处理：不识别、不理解、不上云）。"""
+    result = api_put(
+        _CAMERAS_VOICE_PATH,
+        {"items": [{"did": d, "voice_in_use": False} for d in dids]},
+    )
+    print_result(result, pretty)
 
 @scope_camera.group("schedule")
 def scope_camera_schedule():
