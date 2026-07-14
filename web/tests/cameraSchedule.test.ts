@@ -3,6 +3,7 @@ import {
   isCrossMidnightWindow,
   mergeScheduleWindows,
   normalizeTimeValue,
+  scheduleWindowsEqual,
   weekdaysEqual,
 } from "@/lib/cameraSchedule";
 
@@ -40,6 +41,12 @@ describe("mergeScheduleWindows", () => {
     ).toEqual([{ start: "22:00", end: "07:00" }]);
   });
 
+  it("maps until-midnight same-day tails to 23:59 (no overnight 00:00)", () => {
+    expect(
+      mergeScheduleWindows([{ start: "22:00", end: "00:00" }]),
+    ).toEqual([{ start: "22:00", end: "23:59" }]);
+  });
+
   it("drops zero-length windows", () => {
     expect(
       mergeScheduleWindows([
@@ -49,19 +56,16 @@ describe("mergeScheduleWindows", () => {
     ).toEqual([{ start: "09:00", end: "10:00" }]);
   });
 
-  it("encodes full-day coverage as two abutting halves (not 00:00-00:00)", () => {
+  it("encodes full-day coverage as 00:00-23:59 (not zero-length / no (0,0))", () => {
     expect(
       mergeScheduleWindows([
         { start: "08:00", end: "20:00" },
         { start: "20:00", end: "08:00" },
       ]),
-    ).toEqual([
-      { start: "00:00", end: "12:00" },
-      { start: "12:00", end: "00:00" },
-    ]);
+    ).toEqual([{ start: "00:00", end: "23:59" }]);
   });
 
-  it("encodes a single overnight wrap that fills the day the same way", () => {
+  it("encodes stacked windows that fill the day the same way", () => {
     expect(
       mergeScheduleWindows([{ start: "00:00", end: "00:00" }]),
     ).toEqual([]);
@@ -71,10 +75,7 @@ describe("mergeScheduleWindows", () => {
         { start: "06:00", end: "18:00" },
         { start: "18:00", end: "00:00" },
       ]),
-    ).toEqual([
-      { start: "00:00", end: "12:00" },
-      { start: "12:00", end: "00:00" },
-    ]);
+    ).toEqual([{ start: "00:00", end: "23:59" }]);
   });
 });
 
@@ -83,6 +84,21 @@ describe("isCrossMidnightWindow", () => {
     expect(isCrossMidnightWindow({ start: "22:00", end: "07:00" })).toBe(true);
     expect(isCrossMidnightWindow({ start: "08:00", end: "20:00" })).toBe(false);
     expect(isCrossMidnightWindow({ start: "08:00", end: "08:00" })).toBe(false);
+    expect(isCrossMidnightWindow({ start: "22:00", end: "23:59" })).toBe(false);
+  });
+});
+
+describe("scheduleWindowsEqual", () => {
+  it("compares window lists by value", () => {
+    const a = [{ start: "08:00", end: "20:00" }];
+    expect(scheduleWindowsEqual(a, [{ start: "08:00", end: "20:00" }])).toBe(
+      true,
+    );
+    expect(scheduleWindowsEqual(a, a)).toBe(true);
+    expect(
+      scheduleWindowsEqual(a, [{ start: "08:00", end: "21:00" }]),
+    ).toBe(false);
+    expect(scheduleWindowsEqual(a, [])).toBe(false);
   });
 });
 

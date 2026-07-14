@@ -26,6 +26,7 @@ import {
   isCrossMidnightWindow,
   mergeScheduleWindows,
   normalizeTimeValue,
+  scheduleWindowsEqual,
   weekdaysEqual,
 } from "@/lib/cameraSchedule";
 import { IconClock, IconPlus, IconRefresh, IconTrash, IconX } from "@/lib/icons";
@@ -1097,7 +1098,7 @@ function CameraScheduleDialog({
       setError(t("hero.scheduleNeedWindow"));
       return;
     }
-    if (mergedWindows !== normalizedWindows) {
+    if (!scheduleWindowsEqual(mergedWindows, normalizedWindows)) {
       setWindows(mergedWindows);
     }
     setError(null);
