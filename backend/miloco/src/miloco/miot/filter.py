@@ -342,12 +342,16 @@ def select_active_camera_dids(
     会话建销(refresh_cameras)共用此函数，避免两套判定漂移。
 
     **全拆后返回合成 did（通道粒度）**：单摄裸 did、多摄每路 ``{did}:ch{n}``。过滤按
-    「相机级」（家庭 / 在线 / 定时）+「通道级」（黑名单 per-channel / 镜头 per-lens）两层：
-    在启用家庭内、（``apply_schedule`` 时）当前不在定时暂停窗口、（``online_only`` 时）在线
-    （``require_lan=True`` 看 ``online and lan_online``、``False`` 只看云端 ``online``）；
-    再对每路——未被拉黑（``is_camera_channel_denied``：合成 did 或裸 did 在黑名单皆停）、
-    该路镜头未关（``awake_map[did][channel]`` 明确 ``False`` 才排除；``None``/缺失/``True``
-    放行，未知不误杀）。
+    「相机级」（家庭 / 在线）+「通道级」（黑名单 per-channel / 镜头 per-lens）两层：
+    在启用家庭内、（``online_only`` 时）在线（``require_lan=True`` 看 ``online and
+    lan_online``、``False`` 只看云端 ``online``）；再对每路——未被拉黑
+    （``is_camera_channel_denied``）、该路镜头未关（``awake_map[did][channel]`` 明确
+    ``False`` 才排除；``None``/缺失/``True`` 放行）。
+
+    **上限与定时的顺序（重要）**：先按「未叠加定时」的活跃集做 ``cap`` 截断，再在
+    ``apply_schedule=True`` 时从截断结果里扣掉暂停相机。定时暂停**占名额、不释放**，
+    从而保证投喂集 ⊆ manager 建销集（``refresh_cameras`` 用 ``apply_schedule=False``），
+    不会出现「投喂选中一台从未建 native 会话的相机」。
 
     调用方语义：
     - ``camera_adapter``（感知投喂）：默认 ``apply_schedule=True``，暂停窗口内不投喂。
@@ -355,11 +359,11 @@ def select_active_camera_dids(
       定时暂停不拆 manager；仍应用 awake_map 镜头门。
     - ``get_devices``（列全集/rule 校验）：``cap=False, apply_schedule=False``。
 
-    ``cap=True`` 时上限按**启用通道数**（= 返回的合成 did 数）确定性截断到
+    ``cap=True`` 时上限按**启用通道数**（= 截断前合成 did 数）确定性截断到
     ``MAX_ENABLED_CAMERAS``——每路独立占一个名额，超限按合成 did 升序 ``[:MAX]``，**允许在
-    一台多摄相机中间切开**（会话已为在选的路起、另一路只少一条解码线程）。``cap=False`` 用于
-    「列全集」语义（如 rule target 校验）。会话/manager 生命周期由调用方（refresh_cameras）
-    对返回集取物理 did 收敛：任一路在→会话在、两路都不在→拆。
+    一台多摄相机中间切开**。``cap=False`` 用于「列全集」语义（如 rule target 校验 /
+    ``capped_out`` 判定）。会话/manager 生命周期由调用方（refresh_cameras）对返回集取
+    物理 did 收敛：任一路在→会话在、两路都不在→拆。
 
     ``cameras`` 的 value 需带 ``home_id`` / ``online`` / ``lan_online``（及可选
     ``channel_count``）属性。``awake_map`` 是 per-lens 的 ``{did: {channel: bool|None}}``。
@@ -368,16 +372,9 @@ def select_active_camera_dids(
     from miloco.utils.time_utils import deploy_timezone
 
     denied = denied_camera_dids(kv_repo)
-    schedules = load_schedule_map(kv_repo) if apply_schedule else None
-    if apply_schedule:
-        now = now or datetime.now(deploy_timezone())
     result: list[str] = []
     for did, info in cameras.items():
         if not is_home_allowed(kv_repo, getattr(info, "home_id", None)):
-            continue
-        if apply_schedule and camera_schedule_paused(
-            camera_schedule_for(kv_repo, did, schedules=schedules), now
-        ):
             continue
         online = bool(getattr(info, "online", False))
         lan = bool(getattr(info, "lan_online", False))
@@ -393,10 +390,26 @@ def select_active_camera_dids(
             if lens_awake.get(ch) is False:
                 continue
             result.append(synthetic_camera_did(did, ch, channel_count))
-    if not cap or len(result) <= MAX_ENABLED_CAMERAS:
+    if cap and len(result) > MAX_ENABLED_CAMERAS:
+        # 超限：按合成 did 升序确定性截断（同一账号每轮选同一批），每路独占一个名额、可拦半台。
+        # 必须在定时门控之前截断：暂停相机仍占名额，投喂集才是 manager 池的子集。
+        result = sorted(result)[:MAX_ENABLED_CAMERAS]
+    if not apply_schedule:
         return result
-    # 超限：按合成 did 升序确定性截断（同一账号每轮选同一批），每路独占一个名额、可拦半台。
-    return sorted(result)[:MAX_ENABLED_CAMERAS]
+
+    schedules = load_schedule_map(kv_repo)
+    now = now or datetime.now(deploy_timezone())
+    paused_physical: dict[str, bool] = {}
+    feeding: list[str] = []
+    for syn in result:
+        physical = physical_camera_did(syn)
+        if physical not in paused_physical:
+            paused_physical[physical] = camera_schedule_paused(
+                camera_schedule_for(kv_repo, physical, schedules=schedules), now
+            )
+        if not paused_physical[physical]:
+            feeding.append(syn)
+    return feeding
 
 
 def filter_by_home(kv_repo: KVRepo, items: dict[str, T]) -> dict[str, T]:

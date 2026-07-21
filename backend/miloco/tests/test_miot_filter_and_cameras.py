@@ -220,6 +220,49 @@ def test_select_active_apply_schedule_filters_paused_camera(monkeypatch):
     ) == ["c1"]
 
 
+def test_select_active_schedule_pause_holds_cap_slot(monkeypatch):
+    """暂停相机仍占 cap 名额：投喂集必须是 manager 池的子集，不能顶替未建会话的机。"""
+    monkeypatch.setattr(miot_filter, "MAX_ENABLED_CAMERAS", 4)
+    kv = _FakeKV(
+        {
+            ScopeConfigKeys.HOME_WHITE_LIST_KEY: json.dumps(["H1"]),
+            ScopeConfigKeys.CAMERA_SCHEDULES_KEY: json.dumps(
+                {
+                    "c1": {
+                        "enabled": True,
+                        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                        "windows": [{"start": "08:00", "end": "20:00"}],
+                    }
+                }
+            ),
+        }
+    )
+    cameras = {f"c{i}": _camera(f"c{i}", home_id="H1") for i in range(1, 6)}
+    tz = ZoneInfo("Asia/Shanghai")
+    # 周一 21:00 → c1 定时暂停
+    fake_now = datetime(2026, 6, 29, 21, 0, tzinfo=tz)
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fake_now.astimezone(tz) if tz is not None else fake_now
+
+    monkeypatch.setattr("miloco.miot.filter.datetime", _FrozenDateTime)
+    monkeypatch.setattr("miloco.utils.time_utils.deploy_timezone", lambda: tz)
+
+    manager_pool = miot_filter.select_active_camera_dids(
+        kv, cameras, apply_schedule=False
+    )
+    feeding_pool = miot_filter.select_active_camera_dids(
+        kv, cameras, apply_schedule=True
+    )
+    assert manager_pool == ["c1", "c2", "c3", "c4"]
+    # c1 暂停占名额 → 投喂只有 c2..c4；c5 不得顶上（否则无 manager）
+    assert feeding_pool == ["c2", "c3", "c4"]
+    assert set(feeding_pool).issubset(set(manager_pool))
+    assert "c5" not in feeding_pool
+
+
 # ─── filter.py: write helpers ────────────────────────────────────────────────
 
 

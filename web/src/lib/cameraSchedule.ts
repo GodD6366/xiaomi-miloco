@@ -38,6 +38,9 @@ export function scheduleWindowsEqual(
  * full 24h window (00:00-00:00 is zero-length). Use 23:59 as the latest
  * expressible end so backend `_as_day_intervals` never emits a degenerate
  * (0, 0) slice from overnight windows that end at midnight.
+ *
+ * Trade-off: full-day / until-midnight coverage is [0, 1439); the local
+ * minute 23:59 (60s) is outside the window and counts as schedule-paused.
  */
 const END_OF_DAY = "23:59";
 
@@ -86,9 +89,6 @@ export function mergeScheduleWindows(
   ) {
     const morningEnd = merged[0][1];
     const eveningStart = merged[merged.length - 1][0];
-    if (morningEnd === eveningStart && merged.length === 2) {
-      return [{ start: "00:00", end: END_OF_DAY }];
-    }
     const middle = merged.slice(1, -1);
     const out = middle.map(([start, end]) => ({
       start: minuteToScheduleTime(start),
