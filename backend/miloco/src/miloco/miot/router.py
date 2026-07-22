@@ -25,8 +25,8 @@ from miloco.middleware import (
 from miloco.middleware.exceptions import HTTPException
 from miloco.miot.schema import (
     AuthorizeRequest,
-    CameraSchedule,
     CameraPromptRequest,
+    CameraSchedule,
     CameraToggleRequest,
     CameraVoiceToggleRequest,
     DeviceControlRequest,
