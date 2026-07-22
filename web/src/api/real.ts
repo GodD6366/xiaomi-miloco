@@ -169,6 +169,8 @@ interface BackendPerson {
   num_tier_a_body?: number;
   num_tier_c?: number;
   has_tier_a?: boolean;
+  // 手动上传的显式头像后缀（avatars/persons/<id>.<ext>）；无则 null
+  avatar_ext?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -239,6 +241,7 @@ export async function realListPersons(): Promise<Person[]> {
       faceEnrolled: p.has_tier_a ?? p.face_enrolled,
       voiceEnrolled: p.voice_enrolled,
       avatarHue: i % 6,
+      avatarExt: p.avatar_ext ?? null,
     };
   });
 }
@@ -307,6 +310,31 @@ export async function realEnrollPersonSample(
     const body = await resp.json().catch(() => ({}));
     throw new Error(body.message ?? body.detail ?? `HTTP ${resp.status}`);
   }
+}
+
+export async function realUploadPersonAvatar(
+  personId: string,
+  image: Blob,
+  filename: string,
+): Promise<void> {
+  const form = new FormData();
+  form.append("image", image, filename);
+  const resp = await fetch(`/api/identity/persons/${personId}/avatar`, {
+    method: "POST",
+    body: form,
+    headers: authHeaders(),
+  });
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    throw new Error(body.message ?? body.detail ?? `HTTP ${resp.status}`);
+  }
+}
+
+// 清显式头像（恢复默认→读取回落 tier_a face[0]）
+export async function realDeletePersonAvatar(personId: string): Promise<void> {
+  await apiFetch<Normal<unknown>>(`/api/identity/persons/${personId}/avatar`, {
+    method: "DELETE",
+  });
 }
 
 // ── 家庭档案（home_profile：候选区 / 正式区记忆）─────────────
@@ -967,6 +995,7 @@ interface BackendScopeCamera {
   // 拾音存储偏好（在拾音白名单即 true，**默认 false**，opt-in）。false = 该相机声音
   // 完全不被处理。旧后端无此字段时兜底 false（默认关，与后端默认姿态一致）。
   voice_in_use?: boolean;
+  perception_prompt?: string;
   connected: boolean;
   channel?: number;  // 通道号，用于多通道摄像头
   channel_count?: number;  // 通道总数；判多通道的权威信号（旧后端无则兜底 1）
@@ -1001,6 +1030,7 @@ export async function realListScopeCameras(): Promise<ScopeCamera[]> {
     schedulePaused: c.schedule_paused ?? false,
     schedule: normalizeCameraSchedule(c.schedule),
     nextScheduleChangeAt: c.next_schedule_change_at ?? undefined,
+    perceptionPrompt: c.perception_prompt ?? "",
     connected: c.connected,
     channel: c.channel ?? 0,  // 传递通道号，默认为 0
     channelCount: c.channel_count ?? 1,  // 通道总数，判多通道用；旧后端兜底 1
@@ -1065,6 +1095,24 @@ export async function realToggleScopeCameraVoice(
     body: JSON.stringify({
       items: dids.map((did) => ({ did, voice_in_use: voiceInUse })),
     }),
+  });
+}
+
+export async function realSetScopeCameraPrompt(
+  did: string,
+  text: string,
+): Promise<void> {
+  await apiFetch<Normal<unknown>>("/api/miot/scope/cameras/prompt", {
+    method: "PUT",
+    body: JSON.stringify({ items: [{ did, prompt: text }] }),
+  });
+}
+
+export async function realClearScopeCameraPrompt(did: string): Promise<void> {
+  // did 走 query（?did=…），不带 body：DELETE body 语义未定义、易被代理丢弃。
+  const qs = new URLSearchParams({ did }).toString();
+  await apiFetch<Normal<unknown>>(`/api/miot/scope/cameras/prompt?${qs}`, {
+    method: "DELETE",
   });
 }
 

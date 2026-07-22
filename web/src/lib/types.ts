@@ -45,6 +45,8 @@ export interface Person {
   voiceEnrolled: boolean;
   // 头像底色（personPalette 选）
   avatarHue: number; // 0..5
+  // 手动上传的显式头像后缀（avatars/persons/<id>.<ext>）；无则回落 tier_a face[0] / 占位
+  avatarExt?: string | null;
 }
 
 // ── 设备 ────────────────────────────────────────────────────
@@ -218,6 +220,11 @@ export interface ScopeCamera {
   schedulePaused: boolean;
   schedule: CameraSchedule;
   nextScheduleChangeAt?: string;
+  // 每摄像头自定义「感知须知」prompt（PUT /api/miot/scope/cameras/prompt）。
+  // 该机位专属的环境说明 / 关注 / 忽略事项，逐感知窗注入 omni system prompt 尾部，指导模型
+  // 消解固定误识（如门口机位误把公共走廊电梯门当自家入户门）。"" = 无自定义。与 inUse /
+  // voiceInUse 正交：关着的相机也能预配，仅在被感知时注入生效。多通道相机按 channel 存取。
+  perceptionPrompt: string;
   connected: boolean;
 }
 
