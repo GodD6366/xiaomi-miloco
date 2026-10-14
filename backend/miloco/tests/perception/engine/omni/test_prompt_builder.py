@@ -537,6 +537,65 @@ class TestAudioRoutePayload:
         assert audio_payload["system_prompt"] == audio_payload2["system_prompt"]
 
 
+class TestNoMediaBlockWarning:
+    """拼不出本窗媒体块时必须留痕——生产默认路径（fused + query）逐 route 覆盖。
+
+    与 fused video route 那条（``test_empty_window_guard.py::TestFusedNoMediaBlockWarning``）
+    共用 ``event=fused_no_media_block``，按一个 event 名 grep 就能盖住全部 route。
+    这类分支不在任何主路径上，不实际执行到就等于没写。
+    """
+
+    def test_fused_audio_route_warns_when_audio_unencodable(self, caplog):
+        """audio route 编不出音频 → 打 warning。
+
+        ``_encode_audio_only_mp4`` 对不足一个 AAC 帧的采样返回 None，此时 audio route 的
+        user_content 里一个媒体块都没有（这条路不渲染参考图），模型手里只剩时间和房间名。
+        """
+        from miloco.perception.engine.omni.prompt_builder import build_fused_payload
+
+        ep = _audio_only_packet()
+        ep.audio_clip = np.zeros(512, dtype=np.int16)  # < 一个 AAC 帧 → 编不出
+
+        with caplog.at_level("WARNING"):
+            fused = build_fused_payload(
+                packets=[ep],
+                context=OmniContext(room_name="厨房"),
+                candidates=[],
+                gallery_snapshot={},
+            )
+
+        blocks = fused["messages"][-1]["content"]
+        assert not [b for b in blocks if b.get("type") == "input_audio"]
+        msg = next(
+            r.getMessage() for r in caplog.records
+            if "fused_no_media_block" in r.getMessage()
+        )
+        assert "route=audio" in msg
+        assert "room=厨房" in msg
+
+    def test_query_route_warns_when_video_unencodable(self, caplog):
+        """query 路径拼不出 video 块 → 打 warning。
+
+        query 只有 video 一个媒体块，拼不出就是纯文本问模型「现在怎么样」，而 prompt 里
+        还带着上一窗的 last_caption —— 用户直接读到没有本窗画面依据的现场描述。
+        """
+        from miloco.perception.engine.omni.prompt_builder import build_query_prompt
+
+        ep = _mock_edge_packet()
+        ep.all_frames = []  # _encode_batch_video 拿不到帧 → (None, None)
+
+        with caplog.at_level("WARNING"):
+            payload = build_query_prompt([ep], "厨房现在怎么样")
+
+        assert payload["video_base64"] is None
+        msg = next(
+            r.getMessage() for r in caplog.records
+            if "fused_no_media_block" in r.getMessage()
+        )
+        assert "route=query" in msg
+        assert "room=study-room" in msg
+
+
 class TestBuildMessagesContentBlocks:
     """omni_client._build_messages 块组装（audio vs video route）。"""
 
@@ -1575,8 +1634,9 @@ def _adaptive_packet(
 class TestAdaptiveResolution:
     """Smart Crop(智能裁切增强)在 fused 路径的接线。
 
-    激活看 crop_enhance 双闸(enabled=发版级开关 AND user_enabled=单机用户开关),**与
-    video_short_edge 正交** —— 分辨率档只决定编码短边(全景 / crop / 参考帧),不再决定裁不裁。
+    激活看三闸相与:enabled=发版级开关 AND user_enabled=单机用户开关(两者都在 crop_enhance
+    配置里) AND OmniContext.per_camera_crop_enabled=per-camera 开关(按机位存 KV、逐窗热读)。
+    **与 video_short_edge 正交** —— 分辨率档只决定编码短边(全景 / crop / 参考帧),不决定裁不裁。
     """
 
     def _patches(self, *, short_edge: int = 512, enabled: bool = True, user_enabled: bool = True):
@@ -1593,11 +1653,11 @@ class TestAdaptiveResolution:
             ),
         )
 
-    def _content(self, packet=None, **kwargs):
+    def _content(self, packet=None, context=None, **kwargs):
         from miloco.perception.engine.omni.prompt_builder import build_fused_payload
 
         fused = build_fused_payload(
-            packets=[packet or _adaptive_packet()], context=OmniContext(),
+            packets=[packet or _adaptive_packet()], context=context or OmniContext(),
             gallery_snapshot={}, **kwargs,
         )
         return _multimodal_user_content(fused["messages"])
@@ -1785,6 +1845,93 @@ class TestAdaptiveResolution:
         with p1, p2:
             content = self._content(candidates=[])
         assert not self._has_ref(content)
+
+    def test_off_when_per_camera_switch_off(self):
+        """全局双闸都开,但该机位的 per-camera 闸关 → 回退全景(不裁)。"""
+        p1, p2 = self._patches()  # 两个全局闸都开
+        with p1, p2:
+            content = self._content(
+                context=OmniContext(per_camera_crop_enabled=False), candidates=[]
+            )
+        assert not self._has_ref(content)
+
+    def test_on_when_per_camera_switch_on(self):
+        """per-camera 闸显式为 True 时照旧裁切(与默认值同),证明第三道闸不是恒否。"""
+        p1, p2 = self._patches()
+        with p1, p2:
+            content = self._content(
+                context=OmniContext(per_camera_crop_enabled=True), candidates=[]
+            )
+        assert self._has_ref(content)
+
+    def test_per_camera_switch_defaults_on(self):
+        """OmniContext 不显式给该字段时默认开 —— 老调用点(未透传)零行为变化。"""
+        assert OmniContext().per_camera_crop_enabled is True
+        p1, p2 = self._patches()
+        with p1, p2:
+            content = self._content(candidates=[])
+        assert self._has_ref(content)
+
+    @pytest.mark.parametrize(
+        ("enabled", "user_enabled", "per_camera"),
+        [
+            (False, True, True),
+            (True, False, True),
+            (True, True, False),
+            (False, False, False),
+        ],
+    )
+    def test_any_gate_off_falls_back(self, enabled, user_enabled, per_camera):
+        """三闸是**相与**:任一为 false 就回退全景。"""
+        p1, p2 = self._patches(enabled=enabled, user_enabled=user_enabled)
+        with p1, p2:
+            content = self._content(
+                context=OmniContext(per_camera_crop_enabled=per_camera), candidates=[]
+            )
+        assert not self._has_ref(content)
+
+    def test_per_camera_off_log_carries_device_id(self, caplog):
+        """回退日志必须带 did：4 路交织在同一日志文件里，不带 did 的话行与行字节
+        完全相同，这条日志自称的用途（确认哪台走到了这里）就无法完成。"""
+        import logging
+
+        from miloco.observability.context import (
+            DeviceContext,
+            reset_device_context,
+            set_device_context,
+        )
+
+        p1, p2 = self._patches()
+        token = set_device_context(DeviceContext(
+            device_trace_id="t1", device_id="cam_x:ch1", room_name="客厅"
+        ))
+        try:
+            with p1, p2, caplog.at_level(
+                logging.DEBUG, logger="miloco.perception.engine.omni.prompt_builder"
+            ):
+                self._content(
+                    context=OmniContext(per_camera_crop_enabled=False), candidates=[]
+                )
+        finally:
+            reset_device_context(token)
+
+        hit = [r for r in caplog.records if "reason=per_camera_off" in r.getMessage()]
+        assert hit, "没打出 per_camera_off 回退日志"
+        assert "device_id=cam_x:ch1" in hit[0].getMessage()
+
+    def test_per_camera_off_log_falls_back_to_unknown_without_context(self, caplog):
+        """DeviceContext 未设置时退 unknown，不抛异常（该行在推理主路径上）。"""
+        import logging
+
+        p1, p2 = self._patches()
+        with p1, p2, caplog.at_level(
+            logging.DEBUG, logger="miloco.perception.engine.omni.prompt_builder"
+        ):
+            self._content(
+                context=OmniContext(per_camera_crop_enabled=False), candidates=[]
+            )
+        hit = [r for r in caplog.records if "reason=per_camera_off" in r.getMessage()]
+        assert hit and "device_id=unknown" in hit[0].getMessage()
 
     @pytest.mark.parametrize("short_edge", [360, 512, 768, 1080])
     def test_on_at_any_resolution(self, short_edge):

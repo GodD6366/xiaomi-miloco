@@ -40,7 +40,11 @@ class CropEnhanceConfig:
     crop_enhance.crop_enhance_config_from_settings() 每窗口热读 settings 字典
     (perception.engine.crop_enhance),同 video_short_edge 的模式,改配置免重启。
 
-    激活条件:enabled **且** user_enabled。分两个 key 不是访问控制(本地部署,用户对两个
+    激活条件:enabled **且** user_enabled **且** per-camera 闸。前两个是本配置里的全局闸;
+    第三个不在本配置里 —— 它按机位存在 KV(CAMERA_CROP_DENY_LIST_KEY,deny-list / 默认开),
+    经 OmniContext.per_camera_crop_enabled 透传进
+    omni/prompt_builder._maybe_encode_adaptive 与这两个相与(裁不裁取决于该路镜头的视野,
+    故可单独关掉某个机位)。全局两闸分两个 key 不是访问控制(本地部署,用户对两个
     配置文件都有全权、拦不住),而是配置层与用途不同:
       · enabled = 发版级开关(随包默认层 settings.yaml,不由 admin API 写)——团队随包关/开
         整个能力、或线上出问题时发一版止损;false 时前端开关随之置灰。
@@ -90,7 +94,7 @@ class GateConfig:
     speech_vad_enabled: bool = True
     # threshold=0.4 + min_chunks=3：在 82 幻觉 + 149 真实语音 clip 上实测 FP 4% / FN 5%
     # 的拐点(对话 peak 概率中位 0.998、键鼠噪声 0.10,分得很开)。残留 FP 由下游
-    # needs_response 佐证兜底。speech_prob 已落 trace,后续可据线上分布再调。
+    # needs_response 佐证兜底。speech_prob 进 traces.timing_detail,可据线上分布再调。
     speech_vad_threshold: float = 0.4  # 单帧人声概率阈(silero)
     speech_vad_min_speech_chunks: int = 3  # 需 >= 此数的 512 样本帧过阈才判有人声(抗单次咔哒尖峰)
     # visual 滞回时长(秒)。visual 最近通过过、距今 <= 此值时,本窗 visual
@@ -388,7 +392,7 @@ class IdentityEngineConfig:
 
 @dataclass
 class OmniConfig:
-    model: str = "xiaomi/mimo-v2.5"
+    model: str = "mimo-v2.6-flash"
     api_key: str = ""  # Set via MILOCO_MODEL__OMNI__API_KEY env var or config
     base_url: str = "https://api.xiaomimimo.com/v1"
     max_completion_tokens: int = 512

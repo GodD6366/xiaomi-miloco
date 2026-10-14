@@ -8,7 +8,7 @@ MIoT Client.
 import asyncio
 import logging
 import time
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Set
 
 from miot.error import MIoTClientError
 from miot.spec import MIoTSpecParser
@@ -37,6 +37,7 @@ from .types import (
     MIoTCameraStatus,
     MIoTDeviceBindEvent,
     MIoTDeviceInfo,
+    MIoTDevicePropsEvent,
     MIoTDeviceStateEvent,
     MIoTHomeInfo,
     MIoTLanDeviceInfo,
@@ -50,6 +51,42 @@ from .types import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# 同轮刷新内重复骤降只累加一次,见 get_devices_async 的骤降守卫注释
+_DEVICE_REPLY_SHRINK_MIN_GAP_SEC = 30.0
+# 本轮返回设备数低于缓存这么多倍才视为"骤降"(单个 home 解析失败即触发)
+_DEVICE_REPLY_SHRINK_RATIO = 0.5
+# 重放并发上限。与上层对账的 _RECONCILE_CONCURRENCY 限制的是同一件事
+# (同时在飞的 SUBSCRIBE 条数,压力落在同一个 broker 连接上),调整时两处一起改。
+_REPLAY_CONCURRENCY = 16
+
+
+def _now() -> float:
+    """monotonic 时钟的模块级封装,便于测试只 patch 这一处而不冻结事件循环。"""
+    return time.monotonic()
+
+
+async def _replay_subscriptions(
+    keys: list[str],
+    subscribe: Callable[[str], Awaitable[None]],
+    label: str,
+) -> int:
+    """并发重放一批 tracked key(上限 _REPLAY_CONCURRENCY),best-effort,返回成功数。"""
+    sem = asyncio.Semaphore(_REPLAY_CONCURRENCY)
+
+    async def _one(key: str) -> bool:
+        async with sem:
+            try:
+                await subscribe(key)
+                return True
+            except Exception as e:
+                _LOGGER.warning(
+                    "mips_cloud re-subscribe %s FAILED %s: %s", label, key, e
+                )
+                return False
+
+    results = await asyncio.gather(*(_one(k) for k in keys))
+    return sum(results)
 
 
 class MIoTClient:
@@ -112,6 +149,9 @@ class MIoTClient:
     # Home ids whose `home/{home_id}/scene/#` topic is (intended to be)
     # subscribed. Same ownership model as _meta_sub_dids, but per home.
     _scene_sub_home_ids: set
+    # Dids whose `device/{did}/up/properties_changed/#` topic is (intended to
+    # be) subscribed. Same ownership/replay model as _meta_sub_dids.
+    _props_sub_dids: set
     _callback_scene_changed: Optional[Callable[[MIoTSceneChangedEvent], Any]]
 
     _init_done: bool
@@ -164,6 +204,8 @@ class MIoTClient:
         self._last_lan_ping_ts = 0
         self._callbacks_lan_device_status_changed = {}
         self._device_buffer = None
+        self._device_shrink_streak = 0
+        self._last_device_shrink_ts = 0.0
 
         # mips_cloud state
         self._mips_cloud = None
@@ -171,11 +213,16 @@ class MIoTClient:
         self._callback_user_bind = None
         self._callback_device_meta_changed = None
         self._callback_device_state_changed = None
+        self._callback_device_props_changed = None
         self._meta_sub_dids = set()
         self._state_sub_dids = set()
         self._scene_sub_home_ids = set()
+        self._props_sub_dids = set()
         self._callback_scene_changed = None
         self._callback_mips_connect: Optional[Callable[[], Any]] = None
+        self._callback_subscription_reset: Optional[
+            Callable[[set[str], set[str], set[str], set[str]], Any]
+        ] = None
 
         # Pre-declare sub-client slots so deinit_async can safely walk them
         # even if init_async aborted before creating the full set.
@@ -240,6 +287,10 @@ class MIoTClient:
         if self._cameras_buffer and did in self._cameras_buffer:
             self._cameras_buffer[did].lan_online = info.online
             self._cameras_buffer[did].local_ip = info.ip
+            # 与 get_cameras_async 的全量合并同口径：cross_subnet 必须与 lan_online
+            # 同源同周期搬运，否则增量回调只搬两个字段，跨网段判定会停在上一次
+            # 全量刷新的旧值上（如相机漫游换网段后 IP 已新、跨网段仍是旧值）。
+            self._cameras_buffer[did].cross_subnet = info.cross_subnet
         if did in self._callbacks_lan_device_status_changed:
             await self._callbacks_lan_device_status_changed[did](did, info)
 
@@ -420,6 +471,8 @@ class MIoTClient:
             self._i18n = None  # type: ignore
             self._cameras_buffer = None
             self._device_buffer = None
+            self._device_shrink_streak = 0
+            self._last_device_shrink_ts = 0.0
             self._last_lan_ping_ts = 0
             self._callbacks_lan_device_status_changed = {}
             self._mips_cloud = None
@@ -427,11 +480,14 @@ class MIoTClient:
             self._callback_user_bind = None
             self._callback_device_meta_changed = None
             self._callback_device_state_changed = None
+            self._callback_device_props_changed = None
             self._meta_sub_dids = set()
             self._state_sub_dids = set()
             self._scene_sub_home_ids = set()
+            self._props_sub_dids = set()
             self._callback_scene_changed = None
             self._callback_mips_connect = None
+            self._callback_subscription_reset = None
             self._init_done = False
 
     async def gen_oauth_url_async(self, redirect_uri: Optional[str] = None) -> str:
@@ -554,7 +610,45 @@ class MIoTClient:
         devices: Dict[str, MIoTDeviceInfo] = await self._http_client.get_devices_async(
             home_infos=home_list, fetch_share_home=fetch_share_home
         )
-        if not self._device_buffer:
+        # 一次瞬时"骤降"(整份返空只是极端情形——单个 home 解析失败返回的是部分列表,
+        # cloud.py 对缺字段的 home 静默 continue)不该被当成"账户真的缩了":否则合并分支
+        # 把没返回的 did pop 光,对账会整批退订再重订,推送全断。连续两轮骤降才认缩;
+        # 同轮并发调用(refresh_devices + refresh_cameras)只算一次,窗口锚定本轮第一次。
+        buffered = len(self._device_buffer) if self._device_buffer else 0
+        shrank = buffered > 0 and len(devices) < buffered * _DEVICE_REPLY_SHRINK_RATIO
+        if not shrank:
+            self._device_shrink_streak = 0
+            self._last_device_shrink_ts = 0.0
+        else:
+            now = _now()
+            if now - self._last_device_shrink_ts >= _DEVICE_REPLY_SHRINK_MIN_GAP_SEC:
+                self._device_shrink_streak += 1
+                # 锚点只在开新一轮时推进,否则窗口被同 streak 内的返空续期、永不收敛
+                self._last_device_shrink_ts = now
+            if self._device_shrink_streak < 2:
+                _LOGGER.warning(
+                    "get_devices_async: cloud returned %d devices while %d are "
+                    "buffered; keeping the buffer this round (streak=%d)",
+                    len(devices),
+                    buffered,
+                    self._device_shrink_streak,
+                )
+                await self._merge_lan_status()
+                return self._device_buffer
+            # 认账:buffer 即将与云端对齐,计数器和锚点一并复位——否则紧跟着的
+            # 下一次瞬时骤降会因 streak 仍是 2 而直接穿透守卫。
+            _LOGGER.warning(
+                "get_devices_async: shrink confirmed over %d rounds, "
+                "accepting %d devices (was %d)",
+                self._device_shrink_streak,
+                len(devices),
+                buffered,
+            )
+            self._device_shrink_streak = 0
+            self._last_device_shrink_ts = 0.0
+        # 判 None 而非真值:合并会把未返回的 did pop 光,空 buffer 若被换成新对象,
+        # 上层 _device_info_dict 还指着旧对象、别名断开,对账会拿空字典算差集。
+        if self._device_buffer is None:
             self._device_buffer = devices
         else:
             # Merge cloud updates into existing buffer.
@@ -568,17 +662,29 @@ class MIoTClient:
             for did in list(devices.keys()):
                 self._device_buffer[did] = devices.pop(did)
 
-        # Merge LAN status for all buffered devices.
+        await self._merge_lan_status()
+        return self._device_buffer
+
+    async def _merge_lan_status(self) -> None:
+        """把 LAN 发现合并进 buffered 设备(lan_online / local_ip)。
+
+        正常路径与骤降守卫的提前返回共用——被守卫拦下的那轮,刚上电的相机仍应可被
+        require_lan 发现,lan_online 不能停在上一轮旧值。
+        """
         lan_devices = await self._lan_client.get_devices_async()
         for did in self._device_buffer:
             if did in lan_devices:
                 self._device_buffer[did].lan_online = lan_devices[did].online
                 self._device_buffer[did].local_ip = lan_devices[did].ip
+                # cross_subnet 必须与 lan_online 同源同周期搬运：上层的
+                # _camera_info_dict / _device_info_dict 是本 buffer 的 deepcopy，
+                # 每次 refresh 全量重建。只在上层的 LAN 变化回调里增量写会被这次
+                # 重建抹回 None，而该回调只在在线状态**翻转**时才触发、不会自愈。
+                self._device_buffer[did].cross_subnet = lan_devices[did].cross_subnet
             else:
                 self._device_buffer[did].lan_online = False
-                self._device_buffer[did].local_ip = None
-
-        return self._device_buffer
+                # Keep cloud local_ip — it serves as the unicast probe fallback
+                # for cross-subnet cameras that broadcast can't reach.
 
     async def get_manual_scenes_async(
         self,
@@ -658,6 +764,21 @@ class MIoTClient:
             if did in lan_devices:
                 camera_info.lan_online = lan_devices[did].online
                 camera_info.local_ip = lan_devices[did].ip
+                # 与 lan_online 同源同周期——只靠上层 LAN 回调增量写会被 refresh 的
+                # 全量重建抹回 None，令 stream_nat_blocked 恒 False（诊断永不触发）。
+                camera_info.cross_subnet = lan_devices[did].cross_subnet
+
+        # Sync unicast probe targets for every camera with a known local IP —
+        # not just cross-subnet ones. Cross-subnet cameras need it because
+        # broadcast can't cross the subnet boundary at all; same-subnet ones
+        # need it too because directed subnet broadcast isn't guaranteed
+        # delivery (switch storm control / AP client isolation / router
+        # broadcast rate-limiting), see MIoTLan._probe_unicast_targets.
+        unicast_targets: Dict[str, str] = {}
+        for did, camera_info in self._cameras_buffer.items():
+            if camera_info.local_ip:
+                unicast_targets[did] = camera_info.local_ip
+        self._lan_client.set_unicast_targets(unicast_targets)
 
         return self._cameras_buffer
 
@@ -754,6 +875,36 @@ class MIoTClient:
         """
         return await self._camera_client.unregister_status_changed_async(did=did)
 
+    def set_camera_connected(
+        self, did: str, connected: bool, keep_alive_on_stop: bool = True
+    ) -> None:
+        """Tell the LAN prober whether a camera's native stream is connected.
+
+        Connected cameras are proven reachable, so MIoTLan skips probing
+        them (and throttles the scan interval down to
+        ``OT_PROBE_INTERVAL_MAX`` once every *enabled* camera is connected —
+        it never stops scanning). Call on every camera_status transition.
+
+        ``keep_alive_on_stop`` only matters when ``connected`` is False: True
+        (default) means "we stopped the stream ourselves" and the device keeps a
+        100s keep-alive grace window so it does not blink offline; False means
+        "the native layer reported a failed/lost connection" — that is evidence
+        of *un*reachability, so leave the verdict to the real probes.
+        """
+        self._lan_client.set_camera_connected(
+            did, connected, keep_alive_on_stop=keep_alive_on_stop
+        )
+
+    def set_camera_dids(self, dids: Set[str]) -> None:
+        """Tell the LAN prober the current *scoped* (active) camera set.
+
+        MUST be the set of dids actually expected to connect (home-filtered,
+        not blacklisted, capped, etc.) — not every camera-class device on the
+        account — otherwise a camera outside the current scope would never
+        report connected and the scan interval would never throttle down.
+        """
+        self._lan_client.set_camera_dids(dids)
+
     # ------------------------------------------------------------------ mips
 
     @property
@@ -771,6 +922,23 @@ class MIoTClient:
         so the HTTP status endpoint can report the broker's rejection reason.
         """
         return self._mips_user_sub_error
+
+    async def _fire_subscription_reset(self) -> None:
+        """Hand the upper layer the current tracked sets so it can rebuild
+        its intent mirrors as a faithful copy of what mips actually has."""
+        if not self._callback_subscription_reset:
+            return
+        try:
+            ret = self._callback_subscription_reset(
+                self._meta_sub_dids,
+                self._state_sub_dids,
+                self._scene_sub_home_ids,
+                self._props_sub_dids,
+            )
+            if asyncio.iscoroutine(ret):
+                await ret
+        except Exception as e:
+            _LOGGER.error("subscription reset callback failed: %s", e)
 
     async def _setup_mips_async(self) -> None:
         """Build (or rebuild) the mips_cloud client and attempt user-level subs.
@@ -818,6 +986,17 @@ class MIoTClient:
             )
             self._mips_cloud = None
             self._mips_user_sub_error = f"connect failed: {e}"
+            # 旧实例已在上面拆掉,broker 上一个订阅都不剩。若把三个 tracked 集合
+            # 原样留着,上层对账会算出 to_add = ∅、SDK 侧 `did in set` 短路也会
+            # 吞掉重试,推送要等到下一次 token 刷新重跑本方法才可能恢复(小时级)。
+            # 清空并通知上层重建镜像,下一轮 refresh_* 就能重新下发全量订阅
+            # ——此时 mips 仍不可用,sub_*_async 会抛 MipsConnectionError,
+            # 对账不记录、继续重试,直到连接恢复为止。
+            self._meta_sub_dids = set()
+            self._state_sub_dids = set()
+            self._scene_sub_home_ids = set()
+            self._props_sub_dids = set()
+            await self._fire_subscription_reset()
             return
         self._mips_cloud = mips
         # Listen for unattended-subscribe failures (currently: subscribes
@@ -869,17 +1048,9 @@ class MIoTClient:
         if self._meta_sub_dids:
             dids = sorted(self._meta_sub_dids)
             self._meta_sub_dids = set()
-            ok = 0
-            for did in dids:
-                try:
-                    await self.sub_device_meta_async(did)
-                    ok += 1
-                except Exception as e:
-                    _LOGGER.error(
-                        "mips_cloud re-subscribe device-meta FAILED did=%s: %s",
-                        did,
-                        e,
-                    )
+            ok = await _replay_subscriptions(
+                dids, self.sub_device_meta_async, "device-meta"
+            )
             _LOGGER.info(
                 "mips_cloud re-subscribed device-meta for %d/%d devices",
                 ok,
@@ -890,17 +1061,9 @@ class MIoTClient:
         if self._scene_sub_home_ids:
             home_ids = sorted(self._scene_sub_home_ids)
             self._scene_sub_home_ids = set()
-            ok = 0
-            for home_id in home_ids:
-                try:
-                    await self.sub_home_scene_async(home_id)
-                    ok += 1
-                except Exception as e:
-                    _LOGGER.error(
-                        "mips_cloud re-subscribe home-scene FAILED home=%s: %s",
-                        home_id,
-                        e,
-                    )
+            ok = await _replay_subscriptions(
+                home_ids, self.sub_home_scene_async, "home-scene"
+            )
             _LOGGER.info(
                 "mips_cloud re-subscribed home-scene for %d/%d homes",
                 ok,
@@ -911,22 +1074,40 @@ class MIoTClient:
         if self._state_sub_dids:
             dids = sorted(self._state_sub_dids)
             self._state_sub_dids = set()
-            ok = 0
-            for did in dids:
-                try:
-                    await self.sub_device_state_async(did)
-                    ok += 1
-                except Exception as e:
-                    _LOGGER.error(
-                        "mips_cloud re-subscribe device-state FAILED did=%s: %s",
-                        did,
-                        e,
-                    )
+            ok = await _replay_subscriptions(
+                dids, self.sub_device_state_async, "device-state"
+            )
             _LOGGER.info(
                 "mips_cloud re-subscribed device-state for %d/%d devices",
                 ok,
                 len(dids),
             )
+
+        # Same replay for per-device property push subs.
+        if self._props_sub_dids:
+            dids = sorted(self._props_sub_dids)
+            self._props_sub_dids = set()
+            ok = await _replay_subscriptions(
+                dids, self.sub_device_props_async, "device-props"
+            )
+            _LOGGER.info(
+                "mips_cloud re-subscribed device-props for %d/%d devices",
+                ok,
+                len(dids),
+            )
+
+        # mips 实例被重建 → 上层的订阅意图镜像必须重建为 SDK 重放后的真相:
+        # 若镜像里留着"重放失败的 did"(SDK 集合已无它),下次对账算不出重订;
+        # 若镜像丢了"重放重订上的已解绑 did",下次对账算不出退订。这里在三个
+        # 重放块**之后**把 post-replay 集合交给上层,让镜像成为它们的忠实副本。
+        await self._fire_subscription_reset()
+
+        # 新实例的首次 CONNACK 发生在 register_mips_state_handler 之前
+        # (_dispatch_state_handlers 当时读到的 handler 列表还是空的), _on_mips_connect
+        # 不会被触发。若上一轮连接失败已把 tracked 集合清空、这里重放为空,不主动踢一次
+        # 对账的话 SDK 记账与上层镜像会停在空集,推送要等下一次外部 refresh_* 才恢复
+        # (小时级)。显式补一次,与 paho 重连路径复用同一个入口。
+        self._on_mips_connect(True)
 
     def register_user_bind_callback(
         self, callback: Optional[Callable[[MIoTDeviceBindEvent], Any]]
@@ -967,26 +1148,18 @@ class MIoTClient:
             asyncio.ensure_future(ret)
 
     async def sub_device_meta_async(self, did: str) -> None:
-        """Subscribe one device's `device/{did}/g_op/{rename,hr_change}` meta
-        topics (idempotent).
+        """订阅一台设备的 g_op meta topic(幂等)。
 
-        `_meta_sub_dids` tracks dids confirmed subscribed at the broker, so it
-        stays an accurate mirror: _setup_mips_async replays it after a re-OAuth,
-        and the proxy-level diff in _sync_meta_subscriptions retries anything
-        not in it. A failed SUBACK therefore propagates WITHOUT recording the
-        did — leaving it untracked so the next refresh_devices sync retries it
-        (recording on failure would let the proxy diff short-circuit and the
-        did's meta events would be silently lost forever).
-
-        If mips is not connected yet, only the intent is recorded — the actual
-        subscribe happens at the next setup.
+        失败传播、不记入 `_meta_sub_dids`,让上层 diff 下次重试;mips 不可用时
+        抛 MipsConnectionError(记意图当成功会让上层以为已订阅、重连重放也补不上)。
         """
         if did in self._meta_sub_dids:
             return
         mips = self._mips_cloud
         if mips is None or not mips.is_connected:
-            self._meta_sub_dids.add(did)
-            return
+            raise MipsConnectionError(
+                f"mips_cloud unavailable; device-meta subscribe not issued did={did}"
+            )
         await mips.sub_device_meta_changed_async(did, self._on_device_meta_changed_msg)
         self._meta_sub_dids.add(did)
 
@@ -1020,20 +1193,14 @@ class MIoTClient:
             asyncio.ensure_future(ret)
 
     async def sub_device_state_async(self, did: str) -> None:
-        """Subscribe one device's `device/{did}/state/{online,offline}` cloud
-        state topics (idempotent).
-
-        Same ownership/replay contract as sub_device_meta_async: failed
-        SUBACK propagates WITHOUT recording the did (so the proxy diff
-        retries it); if mips is not connected yet only the intent is
-        recorded and the actual subscribe happens at the next setup.
-        """
+        """订阅一台设备的 state topic(幂等);契约同 sub_device_meta_async。"""
         if did in self._state_sub_dids:
             return
         mips = self._mips_cloud
         if mips is None or not mips.is_connected:
-            self._state_sub_dids.add(did)
-            return
+            raise MipsConnectionError(
+                f"mips_cloud unavailable; device-state subscribe not issued did={did}"
+            )
         await mips.sub_device_state_async(did, self._on_device_state_msg)
         self._state_sub_dids.add(did)
 
@@ -1044,6 +1211,45 @@ class MIoTClient:
         if mips is None:
             return
         await mips.unsub_device_state_async(did)
+
+    def register_device_props_changed_callback(
+        self, callback: Optional[Callable[[MIoTDevicePropsEvent], Any]]
+    ) -> None:
+        """Register the single property-push handler.
+
+        Fires for every subscribed device's `properties_changed` push. Pass
+        None to clear. Several consumers fan out one layer up (MiotProxy) —
+        this slot stays single so the SDK contract matches the other three.
+        """
+        self._callback_device_props_changed = callback
+
+    def _on_device_props_msg(self, msg: MIoTDevicePropsEvent) -> None:
+        cb = self._callback_device_props_changed
+        if cb is None:
+            return
+        ret = cb(msg)
+        if asyncio.iscoroutine(ret):
+            asyncio.ensure_future(ret)
+
+    async def sub_device_props_async(self, did: str) -> None:
+        """订阅一台设备的属性推送(幂等);契约同 sub_device_state_async。"""
+        if did in self._props_sub_dids:
+            return
+        mips = self._mips_cloud
+        if mips is None or not mips.is_connected:
+            raise MipsConnectionError(
+                f"mips_cloud unavailable; device-props subscribe not issued did={did}"
+            )
+        await mips.sub_device_props_async(did, self._on_device_props_msg)
+        self._props_sub_dids.add(did)
+
+    async def unsub_device_props_async(self, did: str) -> None:
+        """Unsubscribe one device's property push subtree."""
+        self._props_sub_dids.discard(did)
+        mips = self._mips_cloud
+        if mips is None:
+            return
+        await mips.unsub_device_props_async(did)
 
     def register_scene_changed_callback(
         self, callback: Optional[Callable[[MIoTSceneChangedEvent], Any]]
@@ -1065,21 +1271,15 @@ class MIoTClient:
             asyncio.ensure_future(ret)
 
     async def sub_home_scene_async(self, home_id: str) -> None:
-        """Subscribe one home's `home/{home_id}/scene/{rename,delete,edit}`
-        topics (idempotent).
-
-        `_scene_sub_home_ids` tracks homes confirmed subscribed at the broker;
-        same ownership model as sub_device_meta_async. A failed SUBACK
-        propagates WITHOUT recording the home, so the next sync retries it
-        instead of the proxy diff short-circuiting on a stale record. If mips is
-        not connected yet, only the intent is recorded.
-        """
+        """订阅一个家庭的 scene topic(幂等);契约同 sub_device_meta_async。"""
         if home_id in self._scene_sub_home_ids:
             return
         mips = self._mips_cloud
         if mips is None or not mips.is_connected:
-            self._scene_sub_home_ids.add(home_id)
-            return
+            raise MipsConnectionError(
+                f"mips_cloud unavailable; home-scene subscribe not issued "
+                f"home={home_id}"
+            )
         await mips.sub_home_scene_changed_async(home_id, self._on_scene_changed_msg)
         self._scene_sub_home_ids.add(home_id)
 
@@ -1101,6 +1301,19 @@ class MIoTClient:
         window, so an unconditional refresh is the safe default.
         """
         self._callback_mips_connect = callback
+
+    def register_subscription_reset_callback(
+        self,
+        callback: Optional[Callable[[set[str], set[str], set[str], set[str]], Any]],
+    ) -> None:
+        """mips 重放后回调上层,把四个重放后的 tracked 集合交回
+        (meta / state / scene / props)。
+
+        参数个数要与 _fire_subscription_reset 的实参一致:少一个的话调用时抛
+        TypeError,而那边的 except Exception 会把它吞掉 —— 表现是上层的订阅镜像
+        静默不再重建。
+        """
+        self._callback_subscription_reset = callback
 
     def _on_mips_connect(self, connected: bool) -> None:
         if not connected:

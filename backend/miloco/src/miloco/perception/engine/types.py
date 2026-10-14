@@ -35,8 +35,8 @@ class GateTrigger:
     # 音频过能量 gate 后,silero VAD 判本窗有真人声。门控 speeches 字段:False 时
     # 下游只剥 speeches(env_sounds / 喂音频不受影响)。audio_active=False 时恒 False。
     speech_active: bool = False
-    # 本窗口由 hold 拉起(visual 不通过、距上次 visual 通过 <= hold_duration_sec)。
-    # _is_audio_only 路由判定上短路:hold=True 不降级到 audio-only,保 video 路由。
+    # 滞回拉起且本窗有帧。给 _is_audio_only 选路用:hold=True 不降级到 audio-only。
+    # 三处 hold 取值的对照见 knowledge/03-features/perception-pipeline.md 的 Gate 小节。
     hold: bool = False
 
 
@@ -70,9 +70,12 @@ class GateTiming:
     vad_ms: float = 0.0
     # silero VAD 本窗人声峰值概率(0-1);audio_active=False 时未评估、为 0。诊断 / 配阈值用。
     speech_prob: float = 0.0
-    # 本窗口是 hold 拉起的(traces_device.gate_hold_pass 落库用)。
-    # passed 属性只表示真通过,hold 不计入;下游不再依赖 passed 决定 packet 是否生成。
+    # 原始滞回判定,只看时间不看有没有帧。给 pipeline 的 HOLD_START / HOLD_EXPIRED /
+    # HOLD_RECOVERED 状态机用 —— 置假会让零帧窗口凭空触发一次 HOLD_EXPIRED。
     hold_pass: bool = False
+    # 滞回真把本窗开出来了(hold_pass 且本窗有帧)。落 traces_device.gate_hold_pass 那一列。
+    # 该列的等价关系与适用范围见 knowledge/03-features/perception-pipeline.md 的 Gate 小节。
+    hold_opened_window: bool = False
     # visual_score 拆分:窗内邻帧 max vs 跨窗(上窗末帧↔本窗首帧)的 max。
     # 诊断用:cross >> intra 持续高,基本是 ISP 长周期漂移(AGC/IR/AWB)误判 motion。
     video_intra_score: float = 0.0
@@ -114,6 +117,27 @@ class TrackedObject:
     face_id: str
     track_id: int
     box_info: list[TrackingBoxInfo]
+    # True ⟺ 本帧 Kalman update 真匹配到 detection；False = 本帧未匹配(coasting)，
+    # 此时框是上一次真匹配时的检测框、原地冻结（不随 Kalman 外推移动，只是越来越旧）。
+    # IdentityEngine 内 7 处闸靠它拒"人已离开或跟丢"产生的残留框：抗遮挡 IoA / omni
+    # 候选 / 名册位置 / no_person 抑制区解除 / no_person 预标 / tier_u 陌生人池推图 /
+    # tier_c 入队；离线视频抽样本路径(identity/extractor.py)另有一处同口径的闸。
+    # 注：身份漂移自检也守同一条不变式，但它比的是整窗累积的质心、不是末帧快照，
+    # 故不读本标记而是比对上一窗算出的相似度（见 state.py::drift_last_sim）。
+    # 其中两处 no_person 闸在 ``no_person.reject_region_enabled`` 之下，该开关出厂关闭
+    # (本包 ``config.py::NoPersonConfigDC`` 与 ``identity/default_config.yaml`` 均为
+    # false)，所在函数开头即整体早退 —— 默认部署下引擎内实际跑到的是 5 处。
+    # 另：``miloco/pet/observe.py``(注意是另一个顶层包、不在 perception/ 下)用
+    # ``time_since_update == 0`` 表达同一条不变式(该路径直接消费 SortTracker 原始
+    # dict、不经本类型)，改判据定义时需一并评估。
+    # 必须由 tracker 一路透传到 engine。
+    # 默认 True：mock 与旧 convert_response 路径不产生 coasting track，其输出的每个
+    # 对象都对应一次真实检测。
+    detected_this_frame: bool = True
+    # 检测器在该 track **最近一次真匹配**时给出的置信度（coasting 帧上不刷新，同 bbox）。
+    # tier_u 候选打分(det_norm，权重最大的一项)与质量门(detector_conf_min)消费；
+    # 必须透传，否则打分里这一维退化成常数。默认 1.0 同上。
+    detector_confidence: float = 1.0
 
 
 @dataclass
@@ -165,7 +189,8 @@ class IdentityTarget:
     box_info: list[TrackingBoxInfo]
     # 末帧归一化 [0,1000] bbox (x1,y1,x2,y2)，与 IdentityQueryItem 同源同坐标系；
     # 供 prompt 在"已识别人物/陌生人"名册里注入位置，多人时让 omni 把姓名挂到
-    # 视频里的人。None = 本帧未被真实检测（coasting 纯预测残留），名册退化为纯名。
+    # 视频里的人。None = 本帧未被真实检测（coasting，框是上一次真匹配时的检测框），
+    # 名册退化为纯名。
     bbox_xyxy_norm: tuple[int, int, int, int] | None = None
     # 翻身份黏旧名期(reverted_from_confirmed)的 track：显示仍黏旧成员名，但**不可作先验**进
     # 名册锚定 omni 重审（与 candidate_tids 同类去先验）。coasting（本窗未派发）时不在
@@ -268,6 +293,15 @@ class OmniContext:
     # 该设备自定义「感知须知」prompt（用户/agent 配置，KV CAMERA_PROMPT_MAP_KEY 逐窗实时读取）。
     # 注入 omni system prompt 尾部（video / audio 路由均注入），给模型补充机位环境 / 关注 / 忽略指导。
     camera_prompt: str | None = None
+    # 该机位（合成 did，多通道逐路）的 Smart Crop per-camera 闸，KV CAMERA_CROP_DENY_LIST_KEY
+    # 逐窗实时读取（不在关闭集 = True，故**默认 True**）。与全局双闸
+    # perception.engine.crop_enhance.enabled / user_enabled **相与**才裁切，见
+    # omni/prompt_builder._maybe_encode_adaptive。False = 该机位改走全景路径（不裁切）。
+    # 名字带 per_camera_ 前缀是刻意的：admin API 的 PerceptionConfigBody 有个
+    # smart_crop_enabled，指的是**全局**用户闸（= crop_enhance.user_enabled，见
+    # admin/router.py），与本字段是相与关系的两个不同层级。两者都是 bool，同名的话跨层
+    # 搬字段时接错哪一个不会有任何类型信号。
+    per_camera_crop_enabled: bool = True
 
 
 

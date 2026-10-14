@@ -111,7 +111,9 @@ class FusedPromptConfig:
     # 家庭多 1-3 只覆盖 99%，仿人 gallery 上限保护；仅 has_pets（video route）时注入。
     # token 已实测（mimo-v2.5，composite 高 320px）：每只 ≈ +194 prompt tokens（3 只上限 ≈ +582），
     # 相对 fused 视频主体（数 K+）为小增量；注入形态 = 最多 3 只 × 每只 1 张 composite（≤3 姿态横拼）。
-    # 待补：端到端延迟 / 成本（需真视频跑完整 fused，随默认开启前的实机验收一起量）。
+    # 注意：默认模型已切 mimo-v2.6-flash，上述标定尚未在 v2.6-flash 复测；若新模型视觉 tokenization /
+    # 分辨率档位与 v2.5 不同，这里的预算换算会失真（上限是静态值不会报错，只会更快逼近 omni 上下文预算）。
+    # 待补：v2.6-flash 复测标定 + 端到端延迟 / 成本（需真视频跑完整 fused，随默认开启前的实机验收一起量）。
     max_pet_refs: int = 3
 
 
@@ -183,6 +185,15 @@ def build_query_prompt(
     video_b64, media_info = _encode_batch_video(
         identity_packets, short_edge=_effective_panorama_short_edge()
     )
+    if not video_b64:
+        # query 路径只有 video 一个媒体块,拼不出就是纯文本问模型"现在怎么样",而 prompt 里
+        # 还注入了上一窗的 last_caption。零帧已由引擎入口的 _drop_frameless_snapshots 挡在
+        # 外面,走到这里说明编码本身失败。event 名与 fused 两条路由一致。
+        logger.warning(
+            "event=fused_no_media_block route=query reason=empty_video room=%s, "
+            "本窗口未拼出 video 块、走 text-only",
+            (identity_packets[0].room_name if identity_packets else None) or "-",
+        )
     return {
         "system_prompt": "\n\n".join(parts),
         "user_content": _build_query_user_content(identity_packets, query, last_caption, label_lookup),
@@ -267,6 +278,15 @@ def build_fused_payload(
                 "本窗口走 text-only",
                 len(audio_b64), _MIN_AUDIO_B64_LEN,
             )
+        else:
+            # 编不出音频(_encode_audio_only_mp4 对过短采样返回 None)。audio route 的
+            # user_content 里没有参考图,一个媒体块都没有时模型手里只剩时间和房间名。
+            # 与 video route 同一个 event 名,一次 grep 覆盖两条路由。
+            logger.warning(
+                "event=fused_no_media_block route=audio reason=empty_audio room=%s, "
+                "本窗口未拼出 input_audio 块、走 text-only",
+                context.room_name or "-",
+            )
         return {
             "messages": _assemble_fused_messages(
                 system_prompt=system_prompt,
@@ -322,11 +342,13 @@ def build_fused_payload(
             return False
         # bbox 为 None 的候选不参与判定:它在全景路径下本就没有锚点(归一化失败等边缘情形),
         # 裁切不会让它更差。
-        # 别把这条读成「coasting 已被上游剔除」:上游那道闸(identity/engine.py 的
-        # detected_this_frame)在出厂 deep_sort 配置下恒 True、实际不生效(issue #494),于是
-        # coasting track 带着纯 Kalman 幻影框走到下面的 remap 判定 —— 要么幻影框被 clamp 成
-        # 贴边框、当成该 track 的锚喂给模型,要么换不出来让整窗回退全景。本文件其余处凡假定
-        # 「coasting 不进候选 / 无 bbox」的注释同样以 #494 为准,修在那边、不在本函数。
+        # coasting(本帧无检测命中)的 track 走不到这里:上游那道闸(identity/engine.py 的
+        # detected_this_frame)已把它拦在 omni 候选之外,名册侧也不会为它填 bbox_norm ——
+        # 故此处无需再防"残留框当锚喂给模型"这类情形。该闸曾因字段在跟踪层与识别层的接缝
+        # 上被丢掉而恒真、实际不生效,自 #494 修复后在出厂 deep_sort 配置下真实生效;若把
+        # tracking_service_mode 回退成 "real"(SortTracker),残留 track 在 tracker 侧就已被
+        # pre-filter,结论不变。本文件其余处假定「coasting 不进候选 / 无 bbox」的注释因此
+        # 都成立。
         # 逐个判而不是 all(...):否决时要能看出是哪个 track、框跑到哪去了 —— 这是灰度期
         # 判断"要不要放宽区域"的唯一数据(只打第一个失败的,足够定位)。
         for c in candidates:
@@ -341,7 +363,11 @@ def build_fused_payload(
                 return False
         return True
 
-    adaptive = _maybe_encode_adaptive(packets, region_ok=_candidate_bbox_ok)
+    adaptive = _maybe_encode_adaptive(
+        packets,
+        region_ok=_candidate_bbox_ok,
+        per_camera_enabled=context.per_camera_crop_enabled,
+    )
     if adaptive is not None:
         video_b64, media_info = adaptive.video_b64, adaptive.media_info
         ref_image_jpeg = adaptive.ref_image_jpeg
@@ -904,6 +930,27 @@ def _build_fused_user_content(
             "本窗口走 text-only 识别",
             len(video_b64), _MIN_VIDEO_B64_LEN,
         )
+    else:
+        # 走到 video 路由却一帧都没有。正常态由 gate 的空输入闸 + 引擎入口的
+        # _drop_empty_snapshots / _drop_frameless_snapshots 挡住,能到这里说明上游某道闸
+        # 失效(或 _AUDIO_ONLY_ENABLED 被回滚、或编码异常)。不留痕这类幻觉就只能靠人
+        # 逐条读 caption 才发现。
+        #
+        # 不能笼统说「无任何媒体块」:宠物参考图(4.5 段)与 gallery 参考图都在主 video 之前
+        # 就已进 content。带上剩余媒体块数是为了区分两种排查方向 —— 0 是「模型什么都没看到」,
+        # >0 是「模型只看到参考图、没有本窗画面」,后者才是看图脑补的高风险形态。
+        other_media = sum(
+            1 for b in content
+            if isinstance(b, dict) and b.get("type") in ("image_url", "input_audio")
+        )
+        logger.warning(
+            "event=fused_no_media_block route=video reason=empty_video room=%s "
+            "other_media_blocks=%d, 本窗口未拼出 video 块、走 text-only"
+            "(other_media_blocks>0 时模型手里只有参考图、没有本窗画面,存在看图脑补风险)"
+            " —— 上游空帧闸可能失效",
+            context.room_name or "-",
+            other_media,
+        )
 
     _log_user_content(content)
     return content
@@ -1365,8 +1412,12 @@ _MIN_VIDEO_B64_LEN = 1000
 # 的 b64 串入 payload 让 omni 服务端 400 Multimodal data is corrupted。
 _MIN_AUDIO_B64_LEN = 500
 
-# 总开关：False 时所有窗口都走 video route（等价于改动前的行为）。
+# 总开关：False 时所有窗口都走 video route（等价于本 route 上线前的行为）。
 # 用于一键回滚 / A/B 对比 / 上游不兼容时的应急关闭。
+#
+# ⚠️ 置 False 会让「零帧 + 音频过闸」的包被拉回 video route，而无帧时不加 video 块 →
+# 退化成纯文本问模型场景。真要回滚，需连带把 gate 的 hold_opens_window 收紧成
+# 「无帧一律不建 packet」。
 _AUDIO_ONLY_ENABLED = True
 
 
@@ -1578,8 +1629,9 @@ def _is_audio_only(packets: list[IdentityPacket]) -> bool:
     batch 场景任一 device visual_changed=True → 整 batch 走全多模态（保守，避免
     同次调用 prompt schema 不一致）。trigger 为 None 时视为非 audio-only（兼容旧路径）。
     总开关 _AUDIO_ONLY_ENABLED=False 时直接返回 False，等价回滚。
-    Hold 短路:trigger.hold=True 表示 visual 在滞回期内,虽本窗 visual 不通过但
-    不应降级到 audio-only,保持 video 路由。
+    Hold 短路:trigger.hold=True 表示 visual 在滞回期内且本窗有帧,不降级到 audio-only。
+    零帧窗口 trigger.hold 恒 False,「零帧 + 音频过闸」因此落到 audio 路由 —— 拉回 video
+    路由会因无帧不加 video 块,退化成纯文本问模型场景。
     """
     if not _AUDIO_ONLY_ENABLED:
         return False
@@ -1743,8 +1795,9 @@ def _encode_batch_crops(edge_packets: list[IdentityPacket]) -> list[dict[str, st
 def _effective_panorama_short_edge() -> int:
     """全景视频短边 = 用户设定值;非正值兜回 512 默认。
 
-    Smart Crop 与本值 **正交**(裁不裁看 crop_enhance 的双 key,不再看这里),所以用户选的
-    768/1080 在 crop 回退全景时依然生效。非正值兜底纯属防御:admin API 已拒 <64,但历史
+    Smart Crop 与本值 **正交**(裁不裁看三闸相与:crop_enhance 的 enabled / user_enabled
+    两个全局闸,加上该路自己的 per-camera 闸,见 _maybe_encode_adaptive;都不看这里),
+    所以用户选的 768/1080 在 crop 回退全景时依然生效。非正值兜底纯属防御:admin API 已拒 <64,但历史
     config.json 可能残留过 0(早期「自适应」哨兵),0 会让 _encode_video_mp4 算出 scale=0 崩掉。
     """
     se = _get_video_short_edge()
@@ -1779,15 +1832,50 @@ def _maybe_encode_adaptive(
     packets: list[IdentityPacket],
     *,
     region_ok: "Callable[[tuple[int, int, int, int], tuple[int, int]], bool] | None" = None,
+    per_camera_enabled: bool = True,
 ) -> "_AdaptiveResult | None":
     """Smart Crop 开启时算 crop 区域、编码 crop 视频 + 全景参考帧。
 
-    返回 None = 回退全景(既有路径)。触发 None 的情形:双闸任一为 false(发版级开关 enabled /
-    单机用户开关 user_enabled)、无帧、无 crop 依据、面积超上限、``region_ok`` 否决、
-    crop/编码/JPEG 失败或产物过短。
+    返回 None = 回退全景(既有路径)。下表是 ``event=adaptive_crop_fallback`` 的**全部**
+    ``reason=`` 取值。排查按 ``grep adaptive_crop_fallback`` 后看 reason,但**注意日志级别**:
+    表里只有 ``per_camera_off`` 是 ``debug``,其余是 ``info`` / ``warning``,而默认
+    ``log_level=info``(root logger 与 console handler 两层都按它设)。所以默认配置下
+    grep **查不到** per_camera_off —— **0 命中不等于"这条路没走到"**,要确认逐机位关闭是否
+    生效得先把级别调到 debug。别据 0 命中判定开关没生效。
+
+    - ``per_camera_off``      —— per-camera 闸关。**本表唯一的 debug 级**(其余为 info /
+                                 warning),默认 log_level=info 下 grep 不到,见上方说明。
+                                 另注:发版级 enabled / 单机 user_enabled 两个全局闸为
+                                 false 时**静默**返回 None、不打任何日志
+    - ``no_frames``           —— 本窗无帧
+    - ``no_activity``         —— 无检测框且无显著运动块,算不出裁切依据(空房间 / 静止画面下
+                                 最常见的一条)
+    - ``area_too_large``      —— 区域面积超 crop_max_area_ratio
+    - ``area_too_small``      —— 区域面积不足 crop_min_area_ratio
+    - ``degenerate``          —— 区域退化成零宽高
+    - ``region_rejected``     —— 调用方的 ``region_ok`` 否决
+    - ``crop_empty``          —— 裁切结果为空
+    - ``video_too_short``     —— 编码产物过短
+    - ``jpeg_too_short``      —— 参考帧 JPEG 过短
+    - ``exception``           —— 兜底异常
+
+    上面 no_frames / no_activity / area_too_large / area_too_small / degenerate 五项由
+    compute_crop_region_detail 给出(no_frames 该函数也会返回,不只本函数自己打),其
+    docstring 是这五项的权威处。
+
+    ``region_ok`` 否决的**细节**另走 ``event=candidate_bbox_veto``(reason=multi_packet /
+    unmappable)——**刻意不同名**,否则按单一 event 统计回退率会翻倍(见 build_fused_payload
+    里 _candidate_bbox_ok 上方注释)。所以那两个 reason 用 grep adaptive_crop_fallback
+    **查不到**,别把它们当本 event 的取值。
+
+    **别在别处复制这份清单的子集** —— 要引用请指回本处,子集会让读者以为列全了。
     crop 视频与参考帧都跟随用户分辨率档,与「裁不裁」正交:crop 视频逐轴贴住同档全景画面
     (含放大),参考帧走 _resize_short_edge 只缩不放 —— 口径差异见上方「全链分辨率」⑥。
     all_frames 只读不改。
+
+    ``per_camera_enabled`` 是**机位级**闸,由调用方从 ``OmniContext.per_camera_crop_enabled``
+    透传(源头是 KV CAMERA_CROP_DENY_LIST_KEY,按合成 did 逐路存、逐窗热读、默认 True)。
+    裁不裁取决于该路镜头的视野,故与两个全局闸相与:门口窄视野机位可单独关掉,不牵动其它机位。
 
     ``region_ok(region, (w, h))`` 是调用方的区域准入校验,在**算出 region 之后、编码与
     ref.jpg/crop_meta 落盘之前**调用,返回 False 即回退全景。它必须在副作用之前:否则
@@ -1806,9 +1894,28 @@ def _maybe_encode_adaptive(
     # (调用方 build_fused_payload 没有 try,抛上去会被 omni.py 折成整相机 skipped)。
     try:
         cfg = crop_enhance_config_from_settings()
-        # 双闸:发版级开关 AND 单机用户开关。任一为 false → 回退全景路径(不裁切)。注意这不等于
-        # 字节回到接本特性前 —— 全景走的 _encode_video_mp4 放大分支已换重采样核,见该函数注释。
+        # 三闸相与:发版级开关 AND 单机用户开关(下面这个 if) AND per-camera 开关(再下一个 if,
+        # 单独判是为了打日志)。任一为 false → 回退全景路径(不裁切)。注意这不等于字节回到接本
+        # 特性前 —— 全景走的 _encode_video_mp4 放大分支已换重采样核,见该函数注释。
         if not (cfg.enabled and cfg.user_enabled):
+            return None
+        # per-camera 闸单独判是为了能打这一行,用来确认"逐机位关闭这条路真的走到了"。
+        # **降到 debug、与同函数其它 reason= 行不同级**,因为它是唯一由**用户配置**决定的回退:
+        # 其它 reason 取决于画面内容(无帧 / 区域太小 / 编码失败),不会长期恒真;而机位一旦关掉
+        # 就每窗必打 —— 4s 窗下约 2.2 万行/天/机位,default log_level=info 会被它灌满。
+        # **带上 did**:IdentityPacket 确实没有该字段、日志器也不注入 DeviceContext,但 pipeline
+        # 在调 omni 前已 set_device_context,本函数整个执行期都在该 ContextVar 作用域内 ——
+        # 同函数末尾的 push_crop_meta 正是靠它取 device_id。不带 did 的话,
+        # MAX_ENABLED_CAMERAS=4 路的日志交织在同一个文件里、行与行字节完全相同,这条日志自称
+        # 的用途("确认这条路真的走到了")就无法完成:分不清是哪台走到了这里。取不到时退 unknown。
+        if not per_camera_enabled:
+            from miloco.observability.context import get_device_context
+
+            _ctx = get_device_context()
+            logger.debug(
+                "event=adaptive_crop_fallback reason=per_camera_off device_id=%s",
+                _ctx.device_id if _ctx else "unknown",
+            )
             return None
         ep = next((p for p in packets if p.all_frames), None)  # 同 _encode_batch_video:首个有帧设备
         if ep is None:
